@@ -2,7 +2,7 @@
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
-[![GitHub Release](https://img.shields.io/github/v/release/pforck/lockly-ha)](https://github.com/pforck/lockly-ha/releases)
+[![GitHub Release](https://img.shields.io/github/v/release/Forcky/LocklyHA)](https://github.com/Forcky/LocklyHA/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Control and monitor your **Lockly smart locks** from Home Assistant. This integration communicates with the Lockly cloud API using the same protocol as the official Lockly mobile app.
@@ -42,13 +42,13 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 
 1. Open HACS in your Home Assistant instance.
 2. Go to **Integrations** → **⋮** → **Custom repositories**.
-3. Add `https://github.com/pforck/lockly-ha` with category **Integration**.
+3. Add `https://github.com/Forcky/LocklyHA` with category **Integration**.
 4. Search for **Lockly** and click **Download**.
 5. Restart Home Assistant.
 
 ### Manual
 
-1. Download the [latest release](https://github.com/pforck/lockly-ha/releases) zip file.
+1. Download the [latest release](https://github.com/Forcky/LocklyHA/releases) zip file.
 2. Extract the `custom_components/lockly` folder into your HA configuration's `custom_components/` directory:
    ```
    config/
