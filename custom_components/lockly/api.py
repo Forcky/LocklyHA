@@ -391,18 +391,25 @@ async def api_get_devices(
 async def api_cached_status(
     session: aiohttp.ClientSession,
     jwt: str,
+    des3_key: bytes,
     email: str,
-    lock_id: str,
+    lock: dict,
 ) -> dict[str, Any] | None:
     """Query lock status from the server cache — NO physical device contact, NO beep.
 
     POST lock/cachedstatus/get  →  {"data": {"addr": "...", "sts": <int>, "time": <long>}}
     Status bits parsed via parse_cached_status().
+
+    Parameters are DES3-encrypted in the 'para' field, matching the pattern used by
+    all other post-auth endpoints (senddata, getstatus, etc.).
     """
+    lock_id = lock["ID"]
+    req = {"acct": email, "dv": lock_id}
+    para = des3_encrypt(des3_key, json.dumps(req, separators=(",", ":")))
     try:
         async with session.post(
             API_BASE + "lock/cachedstatus/get",
-            json={**COMMON_BODY, "acct": email, "dv": lock_id},
+            json={**COMMON_BODY, "para": para},
             headers=_headers(jwt),
         ) as resp:
             body = await resp.json(content_type=None)

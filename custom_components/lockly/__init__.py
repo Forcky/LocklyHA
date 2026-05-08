@@ -86,7 +86,7 @@ class LocklyCoordinator(DataUpdateCoordinator):
             lock_id = lock["ID"]
             # Use cloud cache — no BLE command sent, lock does not beep
             status = await api_cached_status(
-                self._session, self.jwt, self.email, lock_id
+                self._session, self.jwt, self.des3_key, self.email, lock
             )
             if status:
                 result[lock_id] = {**lock, **status}
