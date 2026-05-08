@@ -33,7 +33,7 @@ async def async_setup_entry(
 ) -> None:
     coordinator: LocklyCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        LocklyBatterySensor(coordinator, lock["ID"]) for lock in coordinator.locks
+        LocklyBatterySensor(coordinator, lock) for lock in coordinator.locks
     )
 
 
@@ -54,16 +54,16 @@ class LocklyBatterySensor(CoordinatorEntity, SensorEntity):
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = PERCENTAGE
 
-    def __init__(self, coordinator: LocklyCoordinator, lock_id: str) -> None:
+    def __init__(self, coordinator: LocklyCoordinator, lock: dict) -> None:
         super().__init__(coordinator)
+        lock_id = lock["ID"]
         self._lock_id = lock_id
-        lock_data = coordinator.data.get(lock_id, {})
         self._attr_unique_id = f"lockly_{lock_id}_battery"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, lock_id)},
-            name=_lock_display_name(lock_data, lock_id),
+            name=_lock_display_name(lock, lock_id),
             manufacturer="Lockly",
-            model=lock_data.get("lockType") or "Smart Lock",
+            model=lock.get("lockType") or "Smart Lock",
         )
 
     @property

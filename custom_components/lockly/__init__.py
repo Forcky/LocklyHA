@@ -93,6 +93,8 @@ class LocklyCoordinator(DataUpdateCoordinator):
                 any_ok = True
             elif self.data and lock_id in self.data:
                 result[lock_id] = self.data[lock_id]
+            else:
+                result[lock_id] = dict(lock)  # static fields only; no live status
 
         if not any_ok and self.locks:
             _LOGGER.warning("All lock queries failed — forcing re-login next cycle")

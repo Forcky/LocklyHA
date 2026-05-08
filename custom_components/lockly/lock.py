@@ -24,7 +24,7 @@ async def async_setup_entry(
 ) -> None:
     coordinator: LocklyCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        LocklyLock(coordinator, lock["ID"]) for lock in coordinator.locks
+        LocklyLock(coordinator, lock) for lock in coordinator.locks
     )
 
 
@@ -34,16 +34,16 @@ class LocklyLock(CoordinatorEntity, LockEntity):
     _attr_has_entity_name = True
     _attr_name = None  # use device name as entity name
 
-    def __init__(self, coordinator: LocklyCoordinator, lock_id: str) -> None:
+    def __init__(self, coordinator: LocklyCoordinator, lock: dict) -> None:
         super().__init__(coordinator)
+        lock_id = lock["ID"]
         self._lock_id = lock_id
-        lock_data = coordinator.data.get(lock_id, {})
         self._attr_unique_id = f"lockly_{lock_id}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, lock_id)},
-            name=lock_data.get("na") or lock_data.get("blename") or lock_id,
+            name=lock.get("na") or lock.get("blename") or lock_id,
             manufacturer="Lockly",
-            model=lock_data.get("lockType") or "Smart Lock",
+            model=lock.get("lockType") or "Smart Lock",
         )
 
     @property
