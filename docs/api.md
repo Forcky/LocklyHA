@@ -43,7 +43,7 @@ Client                        Lockly Cloud API              Lockly Hub          
   |--POST qrylknew (RSA para)------->|                           |                    |
   |<--encrypted lock list (DES3)-----|                           |                    |
   |                                  |                           |                    |
-  |--POST lock/cachedstatus/get----->|                           |                    |
+  |--POST cachedstatus/get (DES3)--->|                           |                    |
   |<--cached sts bitmap--------------|                           |                    |
   |                                  |                           |                    |
   |--POST senddata (DES3 para)------>|--BLE frame (AES)--------->|--BLE packet------->|
@@ -549,6 +549,20 @@ The `ACK` field is parsed as described in §10.
 
 **Does NOT contact the physical lock.** No beep. Returns the last state the hub uploaded to the cloud.
 
+### Hub firmware requirement
+
+This endpoint is only supported on hubs with a sufficiently recent firmware build. The check is performed client-side by `BluetoothBean.isSupportHubCacheStatus()` in the APK, and enforced server-side (older hubs return `cod=900`).
+
+| Hub major version | Minimum build | Example |
+|---|---|---|
+| 2 | 422 | `2.2.04.22` |
+| 4 | 401 | `4.0.04.01` |
+| 6 | 503 | `6.0.05.03` |
+
+The version string format is `MAJOR.MINOR.FIX.BUILD`. The check concatenates `FIX` and `BUILD` as a string and parses as an integer — e.g. `"2.2.04.17"` → major=2, build string=`"0417"` → 417 < 422 → **not supported**.
+
+If the hub returns `cod=900`, it means the firmware predates the cached-status feature. The request format is correct; the hub simply does not support the endpoint. Upgrading the hub firmware via the Lockly app will enable it.
+
 ### Request
 
 ```
@@ -556,14 +570,27 @@ POST /pgsmtlkv2/api/lock/cachedstatus/get
 Authorization: Bearer <jwt>
 ```
 
-Body (plain JSON, **no DES3/RSA encryption**):
+The `para` field is **DES3/ECB-encrypted** (same as all other post-auth endpoints — see §6):
+
 ```json
 {
   ...common_body...,
-  "acct": "user@example.com",
-  "dv":   "2d0023003030471333363838"
+  "para": "<base64(DES3_ECB_encrypt({'acct': email, 'dv': lock_id, 'hubid': hub_id}))>"
 }
 ```
+
+Inner JSON (before encryption):
+```json
+{
+  "acct":  "user@example.com",
+  "dv":    "2d0023003030471333363838",
+  "hubid": "PGH220UG2082979T"
+}
+```
+
+Source: `PGNetManager.getCacheStatus()` — `postBody.setPara(DES3Utils.m56333c(hubCacheStatusRequest.getJsonString(), LockerConfig.m61408T()))`. The `HubCacheStatusRequest` class has `@SerializedName("acct")` and `@SerializedName("dv")` fields.
+
+> **Common mistake:** Sending `acct` and `dv` directly in the outer body (not encrypted in `para`) causes `cod=909`. Sending a correctly encrypted `para` but on a hub with old firmware causes `cod=900`.
 
 ### Response
 
@@ -577,6 +604,8 @@ Body (plain JSON, **no DES3/RSA encryption**):
   }
 }
 ```
+
+The `time` field is a Unix timestamp in milliseconds. A value of `0` means the hub has never uploaded state for this lock (hub newly paired or just rebooted).
 
 ### Status bits (`sts` integer)
 
@@ -643,7 +672,7 @@ The `mc` (master code) and `ID` (UUID) are the two inputs needed to derive the A
 | `refresh` | Bearer JWT | None | Refresh JWT |
 | `qrylknew` | Bearer JWT | RSA (para) + DES3 (response) | Get lock list + DES3 key |
 | `senddata` | Bearer JWT | DES3 (para) + AES (BLE) | Live lock query / lock / unlock |
-| `lock/cachedstatus/get` | Bearer JWT | None | Silent cached status |
+| `lock/cachedstatus/get` | Bearer JWT | DES3 (para) | Silent cached status (hub firmware ≥ 422 required) |
 
 ---
 
@@ -693,6 +722,6 @@ The CRC covers all bytes of the frame **including** the type byte, but **excludi
 ### Known unknowns
 
 - The `asyncsend` endpoint (async alternative to `senddata`) exists but is not used by this integration. The request format appears identical; the response is a callback rather than a synchronous ACK.
-- The Aliyun IoT MQTT subscription (`iotdm`, `iotprodkey`) is not used. Subscribing to the MQTT topic for each lock would give push-based state updates without polling.
+- **MPPS push channel** — the Lockly app subscribes to a push channel per lock at `apiserv04c.lockly.com/mpps/v1/channel` (GET to list channels, POST to manage subscriptions). The channel names are the lock UUIDs (e.g. `2D0023003030471333363838`). When the lock state changes, a push notification is delivered to these channels. Implementing this push subscription in HA would provide real-time state updates without any polling or BLE commands. The Aliyun IoT MQTT path (`iotdm`, `iotprodkey`) appears to be an alternative push mechanism for older firmware.
 - Some Lockly hardware generations use an older BLE command set (command `7` = `HostUnlockCmd`). The integration targets AES-capable locks (command `22` = `NewUnlockCmd`); older locks are untested.
 - The `lock/cachedstatus/get` response `time` field is a Unix timestamp in milliseconds. Values of 0 indicate the hub has never uploaded state for this lock.

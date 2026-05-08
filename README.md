@@ -20,7 +20,7 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 | Battery low warning | ✅ |
 | Door sensor state (if fitted) | ✅ |
 | Multiple locks per account | ✅ |
-| Silent polling — lock does not beep | ✅ |
+| Silent polling — lock does not beep during polls | ✅ |
 | Config flow UI | ✅ |
 | HACS installable | ✅ |
 
@@ -85,44 +85,69 @@ Each lock appears as a separate HA device.
 Each lock creates two entities:
 
 ### Lock entity
+
 - **State**: `locked` or `unlocked`
 - **Services**: `lock.lock`, `lock.unlock`
 - **Attributes**:
   - `door_sensor_open` — state of the magnetic door sensor, if the lock has one fitted
-  - `firmware_version` — lock firmware string (when available from a live query)
-  - `auto_unlock_delay_s` — configured auto-lock delay in seconds (when available)
+  - `firmware_version` — lock firmware string (available from live query)
+  - `auto_unlock_delay_s` — configured auto-lock delay in seconds (available from live query)
 
 ### Battery sensor
+
 - **State**: `10` (%) when the lock reports low battery, `90` (%) otherwise
 - **Device class**: `battery`
 - **Attributes**:
-  - `low_battery` — raw boolean from the cloud cache
+  - `low_battery` — raw boolean from the cloud or live query
 
-> **Battery percentage note:** The Lockly cloud cache only exposes a binary low/normal flag, not a precise voltage. The 10 % / 90 % values are representative sentinels, not real measurements. A real percentage (derived from the battery voltage) is only available from a live BLE-over-hub query, which causes the lock to beep — so it is not used for routine polling.
+> **Battery percentage note:** The Lockly cloud cache only exposes a binary low/normal flag, not a precise voltage. The 10 % / 90 % values are representative sentinels, not real measurements.
 
 ---
 
 ## How It Works
 
-### Polling (silent)
+### Startup
 
-The integration polls the Lockly cloud cache endpoint (`lock/cachedstatus/get`) every 30 seconds. This endpoint returns the last known state that the Lockly hub uploaded — **no BLE command is ever sent to the physical lock during polling**, so the lock does not beep.
+When the integration loads, it authenticates with the Lockly cloud and retrieves the full lock list. It then attempts one silent cloud-cache poll per lock. If that fails (e.g. hub firmware is too old), it sends one live BLE query per lock to get the initial state. This may cause a brief **one-time beep** on each lock at startup.
+
+### Polling (silent, every 30 seconds)
+
+The integration polls the Lockly cloud cache endpoint (`lock/cachedstatus/get`) every 30 seconds. This endpoint returns the last known state the hub uploaded to the cloud — **no BLE command is ever sent to the physical lock during polling**, so the lock does not beep.
+
+#### Hub firmware requirement for silent polling
+
+Silent polling requires hub firmware with a sufficiently recent build number:
+
+| Hub major version | Minimum build |
+|---|---|
+| 2.x | 422 (e.g. `2.2.04.22`) |
+| 4.x | 401 |
+| 6.x | 503 |
+
+If the hub firmware is older than these minimums, the server returns an error and the integration switches to "no-poll" mode: state is preserved from the last successful query and only updates when a lock/unlock command is sent through HA. **No periodic BLE commands are ever sent** — the lock will not beep on a timer regardless of hub firmware version.
+
+To check your hub firmware, look in the Lockly app under Hub settings, or check the HA logs for a line like:
+```
+Lockly: cachedstatus unsupported for this hub (hub firmware too old) — state will only update after HA commands
+```
 
 ### Lock / Unlock actions
 
-When you lock or unlock from HA, the integration sends a BLE command through the Lockly cloud and hub to the physical lock via the `senddata` endpoint. The lock will beep once to acknowledge the command. The state is then refreshed from the cloud cache.
+When you lock or unlock from HA, the integration sends a BLE command through the Lockly cloud and hub to the physical lock. The lock will beep once to acknowledge the command. The lock state in HA updates immediately (optimistically) without waiting for the next poll cycle.
 
 ### Authentication
 
-Credentials (email and password) are stored in HA's config entry. The integration obtains a short-lived JWT at startup and automatically re-authenticates when it expires.
+Credentials (email and password) are stored in HA's config entry. The integration obtains a JWT at startup and automatically re-authenticates when it expires.
 
 ---
 
 ## Known Limitations
 
 - **Bluetooth-only locks** (without a PGH hub) are not supported.
-- **Battery percentage** is approximate (binary low/normal flag only).
-- **Lock command** (`lock.lock`) has been implemented but not extensively tested across all Lockly hardware generations. If it doesn't close your lock, please open an issue with your lock model.
+- **Silent polling requires hub firmware build ≥ 422** (for major version 2 hubs). On older firmware, state only updates when commanded through HA or when the integration restarts.
+- **No real-time push updates**: If the lock is physically operated (keypad, fingerprint, app), HA will not reflect the change until the next successful poll or an HA command is sent.
+- **Battery percentage is approximate** (binary low/normal flag only).
+- **Lock command** (`lock.lock`) has been implemented but not extensively tested across all Lockly hardware generations. If it does not close your lock, please open an issue with your lock model.
 - The Lockly API is undocumented and reverse-engineered. A firmware update by Lockly could break this integration. See [`docs/api.md`](docs/api.md) for the full protocol documentation.
 - The RSA keys embedded in `api.py` are extracted from **Lockly app version 3.2.9**. If Lockly rotates the keys in a later app release, the integration will stop working until updated.
 
@@ -140,6 +165,13 @@ Credentials (email and password) are stored in HA's config entry. The integratio
 
 **Locks show as unavailable after setup**
 - The cloud cache may take up to 60 seconds to warm up after a hub reconnect. Wait and then reload the integration.
+
+**Lock state does not update when physically used**
+- This is expected when your hub firmware is below the silent-polling minimum. State updates only when commanded through HA or at the next restart.
+- To get background state sync, update your hub firmware via the Lockly app to version `2.x.04.22` or later (for PGH220-series hubs).
+
+**Locks beep every 30 seconds**
+- This should not happen with the current version. If it does, check you are running the latest release and reload the integration.
 
 **Unlock works but lock does not close the door**
 - Some older Lockly hardware generations may use a different BLE command for locking. Open an issue with your lock's BLE name (shown in the Lockly app) so support can be added.
@@ -162,6 +194,7 @@ logger:
 Pull requests welcome. Please:
 - Open an issue first for significant changes.
 - Include your lock model and hub model if reporting a device-specific bug.
+- Read [`AGENTS.md`](AGENTS.md) for architecture notes and critical invariants before writing code.
 - See [`docs/api.md`](docs/api.md) for the full API protocol — useful background if you're extending the integration.
 
 ---
