@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import api_cached_status, api_get_devices, api_lock, api_login, api_unlock
+from .api import api_cached_status, api_get_devices, api_lock, api_login, api_query_lock_status, api_unlock
 from .const import CONF_EMAIL, CONF_PASSWORD, DOMAIN, SCAN_INTERVAL_SECONDS
 
 _LOGGER = logging.getLogger(__name__)
@@ -58,6 +58,9 @@ class LocklyCoordinator(DataUpdateCoordinator):
         self.des3_key: bytes | None = None
         self.locks: list[dict] = []
         self._session: aiohttp.ClientSession | None = None
+        # Tracks whether the cloud cache endpoint works for this account/hub.
+        # Starts as True (optimistic); flipped to False on first all-lock 900 run.
+        self._cache_supported: bool = True
 
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
@@ -71,6 +74,7 @@ class LocklyCoordinator(DataUpdateCoordinator):
         self.locks, self.des3_key = await api_get_devices(self._session, self.jwt, self.email)
         if not self.locks:
             raise UpdateFailed("Lockly: no locks found after login")
+        self._cache_supported = True  # re-probe on next cycle after auth refresh
         _LOGGER.info("Lockly: authenticated, found %d lock(s)", len(self.locks))
 
     async def _async_update_data(self) -> dict:
@@ -81,20 +85,40 @@ class LocklyCoordinator(DataUpdateCoordinator):
 
         result: dict = {}
         any_ok = False
+        cache_failed_count = 0
 
         for lock in self.locks:
             lock_id = lock["ID"]
-            # Use cloud cache — no BLE command sent, lock does not beep
-            status = await api_cached_status(
-                self._session, self.jwt, self.des3_key, self.email, lock
-            )
+            status = None
+
+            if self._cache_supported:
+                status = await api_cached_status(
+                    self._session, self.jwt, self.des3_key, self.email, lock
+                )
+                if status is None:
+                    cache_failed_count += 1
+
+            if status is None:
+                # Fall back to live BLE-over-hub query (lock will receive a BLE frame;
+                # a status-query command does not actuate the motor).
+                status = await api_query_lock_status(
+                    self._session, self.jwt, self.email, self.des3_key, lock
+                )
+
             if status:
                 result[lock_id] = {**lock, **status}
                 any_ok = True
             elif self.data and lock_id in self.data:
                 result[lock_id] = self.data[lock_id]
             else:
-                result[lock_id] = dict(lock)  # static fields only; no live status
+                result[lock_id] = dict(lock)
+
+        # If every lock failed cached status, disable it to avoid pointless requests.
+        if self._cache_supported and cache_failed_count == len(self.locks) and self.locks:
+            _LOGGER.info(
+                "Lockly: cachedstatus unsupported for this hub — switching to live BLE queries"
+            )
+            self._cache_supported = False
 
         if not any_ok and self.locks:
             _LOGGER.warning("All lock queries failed — forcing re-login next cycle")

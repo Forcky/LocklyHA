@@ -395,7 +395,7 @@ async def api_cached_status(
         ) as resp:
             body = await resp.json(content_type=None)
             if str(body.get("cod")) != "200":
-                _LOGGER.warning("cachedstatus failed: cod=%s lock=%s", body.get("cod"), lock_id)
+                _LOGGER.debug("cachedstatus failed: cod=%s lock=%s", body.get("cod"), lock_id)
                 return None
             data = body.get("data") or {}
             sts = data.get("sts")
@@ -441,7 +441,10 @@ async def api_query_lock_status(
                     "senddata failed: cod=%s lock=%s", body.get("cod"), lock.get("blename")
                 )
                 return None
-            return parse_ack(body["ACK"], mc, uuid)
+            parsed = parse_ack(body["ACK"], mc, uuid)
+            if parsed and "battery_invalid" in parsed:
+                parsed.setdefault("low_battery", parsed["battery_invalid"])
+            return parsed
     except Exception:
         _LOGGER.exception("senddata request failed for lock %s", lock.get("blename"))
         return None
