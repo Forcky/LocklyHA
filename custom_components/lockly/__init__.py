@@ -58,9 +58,10 @@ class LocklyCoordinator(DataUpdateCoordinator):
         self.des3_key: bytes | None = None
         self.locks: list[dict] = []
         self._session: aiohttp.ClientSession | None = None
-        # Tracks whether the cloud cache endpoint works for this account/hub.
-        # Starts as True (optimistic); flipped to False on first all-lock 900 run.
+        # True until we confirm cached-status is unsupported for this hub.
         self._cache_supported: bool = True
+        # Lock IDs that still need a one-time live query for their initial state.
+        self._pending_live_init: set[str] = set()
 
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
@@ -74,7 +75,8 @@ class LocklyCoordinator(DataUpdateCoordinator):
         self.locks, self.des3_key = await api_get_devices(self._session, self.jwt, self.email)
         if not self.locks:
             raise UpdateFailed("Lockly: no locks found after login")
-        self._cache_supported = True  # re-probe on next cycle after auth refresh
+        self._cache_supported = True
+        self._pending_live_init = {lock["ID"] for lock in self.locks}
         _LOGGER.info("Lockly: authenticated, found %d lock(s)", len(self.locks))
 
     async def _async_update_data(self) -> dict:
@@ -98,25 +100,29 @@ class LocklyCoordinator(DataUpdateCoordinator):
                 if status is None:
                     cache_failed_count += 1
 
-            if status is None:
-                # Fall back to live BLE-over-hub query (lock will receive a BLE frame;
-                # a status-query command does not actuate the motor).
+            # One-time live query for initial state when cache is unavailable.
+            # This sends a BLE frame to the lock (it will beep once at startup),
+            # but is not repeated on subsequent polls.
+            if status is None and lock_id in self._pending_live_init:
                 status = await api_query_lock_status(
                     self._session, self.jwt, self.email, self.des3_key, lock
                 )
+                if status is not None:
+                    self._pending_live_init.discard(lock_id)
 
             if status:
                 result[lock_id] = {**lock, **status}
                 any_ok = True
             elif self.data and lock_id in self.data:
                 result[lock_id] = self.data[lock_id]
+                any_ok = True  # kept from previous good state
             else:
                 result[lock_id] = dict(lock)
 
-        # If every lock failed cached status, disable it to avoid pointless requests.
         if self._cache_supported and cache_failed_count == len(self.locks) and self.locks:
             _LOGGER.info(
-                "Lockly: cachedstatus unsupported for this hub — switching to live BLE queries"
+                "Lockly: cachedstatus unsupported for this hub (hub firmware too old) — "
+                "state will only update after HA commands"
             )
             self._cache_supported = False
 
@@ -132,7 +138,7 @@ class LocklyCoordinator(DataUpdateCoordinator):
             return False
         ok = await api_unlock(self._session, self.jwt, self.email, self.des3_key, lock)
         if ok:
-            await self.async_request_refresh()
+            self._set_optimistic_lock_state(lock_id, is_locked=False)
         return ok
 
     async def async_lock_lock(self, lock_id: str) -> bool:
@@ -141,8 +147,13 @@ class LocklyCoordinator(DataUpdateCoordinator):
             return False
         ok = await api_lock(self._session, self.jwt, self.email, self.des3_key, lock)
         if ok:
-            await self.async_request_refresh()
+            self._set_optimistic_lock_state(lock_id, is_locked=True)
         return ok
+
+    def _set_optimistic_lock_state(self, lock_id: str, is_locked: bool) -> None:
+        if self.data and lock_id in self.data:
+            updated = {**self.data, lock_id: {**self.data[lock_id], "is_locked": is_locked}}
+            self.async_set_updated_data(updated)
 
     def _get_lock(self, lock_id: str) -> dict | None:
         return next((l for l in self.locks if l["ID"] == lock_id), None)
