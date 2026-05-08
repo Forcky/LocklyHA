@@ -16,25 +16,25 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import LocklyCoordinator
-from .const import DOMAIN
+from .const import BATTERY_MAX_V, BATTERY_MIN_V, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# Voltage values are only available from a live senddata query (not cached status).
-# Cached status only has LOW_BAT_BIT.  When low battery is flagged we report 10%;
-# when the flag is clear we have no precise percentage to show, so we report None.
+# Sentinel percentages used when only the binary low/normal flag is available
+# (cloud cache endpoint, or live query with battery_invalid=True).
 _LOW_BAT_PCT = 10
+_OK_BAT_PCT = 90
 
 
-async def async_setup_entry(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
-    coordinator: LocklyCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
-        LocklyBatterySensor(coordinator, lock) for lock in coordinator.locks
-    )
+def _voltage_to_pct(raw: int) -> int:
+    """Convert raw wakeup_voltage (10 mV units) to a clamped battery percentage.
+
+    Voltage range for 4×AA: BATTERY_MIN_V (empty) to BATTERY_MAX_V (full).
+    raw * 0.01 = volts  (raw is in units of 10 mV = 0.01 V)
+    """
+    volts = raw * 0.01
+    pct = (volts - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V) * 100
+    return max(0, min(100, round(pct)))
 
 
 def _lock_display_name(lock_data: dict, lock_id: str) -> str:
@@ -42,10 +42,11 @@ def _lock_display_name(lock_data: dict, lock_id: str) -> str:
 
 
 class LocklyBatterySensor(CoordinatorEntity, SensorEntity):
-    """Battery indicator for a Lockly lock.
+    """Battery level for a Lockly lock.
 
-    Reports 10 % when the lock's low-battery flag is set; None otherwise
-    (the cloud cache does not expose a precise voltage).
+    Uses the wakeup_voltage from the live BLE query (one-time at startup) for a
+    real percentage.  Falls back to 10 % / 90 % sentinels when only the binary
+    low-battery flag is available (cloud cache or invalid voltage reading).
     """
 
     _attr_has_entity_name = True
@@ -73,16 +74,28 @@ class LocklyBatterySensor(CoordinatorEntity, SensorEntity):
     @property
     def native_value(self) -> int | None:
         d = self._lock_data
+
+        # Real voltage — present after a live BLE query (startup or post-command).
+        raw_v = d.get("wakeup_voltage")
+        if raw_v is not None and not d.get("battery_invalid"):
+            return _voltage_to_pct(raw_v)
+
+        # Binary flag — from cloud cache (cachedstatus) or invalid voltage.
         low = d.get("low_battery")
         if low is None:
-            return None          # no data yet → unavailable
-        return _LOW_BAT_PCT if low else 90  # 90 = proxy for "OK"
+            return None  # no data yet → unavailable
+        return _LOW_BAT_PCT if low else _OK_BAT_PCT
 
     @property
     def extra_state_attributes(self) -> dict:
         d = self._lock_data
         attrs: dict = {}
+        raw_v = d.get("wakeup_voltage")
+        if raw_v is not None:
+            attrs["voltage"] = round(raw_v * 0.01, 2)
         low = d.get("low_battery")
         if low is not None:
             attrs["low_battery"] = low
+        if d.get("battery_invalid"):
+            attrs["battery_invalid"] = True
         return attrs
