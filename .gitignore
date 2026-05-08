@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.claude/
+APK/
+lockly_apk_analysis/
+null

@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Lockly Account",
+        "description": "Enter your Lockly app credentials.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password",
+      "no_devices": "Login succeeded but no locks were found",
+      "cannot_connect": "Unable to connect to Lockly servers"
+    },
+    "abort": {
+      "already_configured": "Lockly account is already configured"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "domain": "lockly",
+  "name": "Lockly",
+  "version": "0.1.0",
+  "documentation": "https://github.com/pforck/lockly-ha",
+  "issue_tracker": "https://github.com/pforck/lockly-ha/issues",
+  "requirements": ["pycryptodome>=3.9.0"],
+  "dependencies": [],
+  "codeowners": ["@pforck"],
+  "iot_class": "cloud_polling",
+  "config_flow": true
+}
