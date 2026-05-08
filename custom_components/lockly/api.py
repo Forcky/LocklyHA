@@ -9,24 +9,12 @@ from datetime import datetime
 from typing import Any
 
 import aiohttp
+from Crypto.Cipher import AES, DES3
+from Crypto.PublicKey import RSA
 
 from .const import API_BASE, API_USER_AGENT, COMMON_BODY, SENDDATA_TIMEOUT
 
 _LOGGER = logging.getLogger(__name__)
-
-# ── Lazy crypto imports (pycryptodome) ────────────────────────────────────────
-
-def _aes():
-    from Crypto.Cipher import AES
-    return AES
-
-def _des3():
-    from Crypto.Cipher import DES3
-    return DES3
-
-def _rsa():
-    from Crypto.PublicKey import RSA
-    return RSA
 
 
 # ── Embedded RSA keys (extracted from libkey.so in Lockly APK 3.2.9) ─────────
@@ -62,7 +50,6 @@ _PRIV_KEY_OBJ = None
 def _get_pub_key():
     global _PUB_KEY_OBJ
     if _PUB_KEY_OBJ is None:
-        RSA = _rsa()
         der = base64.b64decode(_PUB_KEY_DER_B64)
         _PUB_KEY_OBJ = RSA.import_key(der)
     return _PUB_KEY_OBJ
@@ -71,7 +58,6 @@ def _get_pub_key():
 def _get_priv_key():
     global _PRIV_KEY_OBJ
     if _PRIV_KEY_OBJ is None:
-        RSA = _rsa()
         der = base64.b64decode(_PRIV_KEY_DER_B64)
         _PRIV_KEY_OBJ = RSA.import_key(der)
     return _PRIV_KEY_OBJ
@@ -107,7 +93,6 @@ def des3_key_from_server_key(server_key_str: str) -> bytes:
 
 def des3_encrypt(des3_key: bytes, plaintext: str) -> str:
     """DES3/ECB encrypt with PKCS7 padding → base64 output."""
-    DES3 = _des3()
     data = plaintext.encode("utf-8")
     pad_len = 8 - (len(data) % 8)
     data += bytes([pad_len] * pad_len)
@@ -116,7 +101,6 @@ def des3_encrypt(des3_key: bytes, plaintext: str) -> str:
 
 def des3_decrypt(des3_key: bytes, b64_data: str) -> bytes:
     """DES3/ECB decrypt base64 ciphertext → bytes (PKCS7 stripped)."""
-    DES3 = _des3()
     ct = base64.b64decode(b64_data + "==")
     pt = DES3.new(des3_key, DES3.MODE_ECB).decrypt(ct)
     pad = pt[-1]
@@ -174,7 +158,6 @@ def _build_cmd_hex(cmd_code: str, master_code: str, uuid: str, extra_fields: str
     Command content (NewUnlockCmd AES path):
       cmd_code + mc_len + enc_mc + "02" + pwd_id("0100") + extra_fields + time_hex + "01"
     """
-    AES = _aes()
     enc_mc = encrypt_master_code(master_code, uuid)
     mc_len = f"{len(enc_mc) // 2:02x}"
     aes_key = derive_aes_key(master_code, uuid)
@@ -200,7 +183,6 @@ def _build_cmd_hex(cmd_code: str, master_code: str, uuid: str, extra_fields: str
 
 def build_query_status_cmd(master_code: str, uuid: str) -> str:
     """Build QueryLockStatus BLE command hex string for senddata 'cmd' field."""
-    AES = _aes()
     enc_mc = encrypt_master_code(master_code, uuid)
     mc_len = f"{len(enc_mc) // 2:02x}"
     aes_key = derive_aes_key(master_code, uuid)
@@ -245,7 +227,6 @@ def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
     Response BLE frame: HEAD(4)+LEN(2)+CMD_TYPE(2)+AES_PAYLOAD(32)+CRC(1) = 41 bytes
     AES payload = ack_hex[16:-2]
     """
-    AES = _aes()
     h = ack_hex.upper()
     payload_hex = h[16:-2]
     aes_key = derive_aes_key(master_code, uuid)
@@ -404,7 +385,7 @@ async def api_cached_status(
     all other post-auth endpoints (senddata, getstatus, etc.).
     """
     lock_id = lock["ID"]
-    req = {"acct": email, "dv": lock_id}
+    req = {"acct": email, "dv": lock_id, "hubid": lock.get("hubid", "")}
     para = des3_encrypt(des3_key, json.dumps(req, separators=(",", ":")))
     try:
         async with session.post(
