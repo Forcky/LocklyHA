@@ -101,14 +101,14 @@ class LocklyCoordinator(DataUpdateCoordinator):
                     cache_failed_count += 1
 
             # One-time live query for initial state when cache is unavailable.
-            # This sends a BLE frame to the lock (it will beep once at startup),
-            # but is not repeated on subsequent polls.
+            # Discard from the pending set unconditionally so a failed query is
+            # not retried on the next poll (which would cause repeated BLE sends
+            # and beeping on hubs where cachedstatus is unsupported).
             if status is None and lock_id in self._pending_live_init:
+                self._pending_live_init.discard(lock_id)
                 status = await api_query_lock_status(
                     self._session, self.jwt, self.email, self.des3_key, lock
                 )
-                if status is not None:
-                    self._pending_live_init.discard(lock_id)
 
             if status:
                 result[lock_id] = {**lock, **status}

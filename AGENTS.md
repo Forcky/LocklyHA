@@ -113,7 +113,26 @@ from Crypto.Cipher import AES, DES3
 from Crypto.PublicKey import RSA
 ```
 
-### 6. Optimistic state updates after commands
+### 6. `_pending_live_init` must be discarded unconditionally
+
+`_pending_live_init` tracks locks that still need a one-time startup BLE query. The discard **must happen before** calling `api_query_lock_status`, not inside the success branch:
+
+```python
+# CORRECT — always one-time, even if query fails
+if status is None and lock_id in self._pending_live_init:
+    self._pending_live_init.discard(lock_id)
+    status = await api_query_lock_status(...)
+
+# WRONG — failed queries stay in the set and are retried every poll
+if status is None and lock_id in self._pending_live_init:
+    status = await api_query_lock_status(...)
+    if status is not None:
+        self._pending_live_init.discard(lock_id)  # never reached on failure
+```
+
+On hubs where `cachedstatus` is unsupported (`_cache_supported = False`), every poll produces `status = None`. If a lock stays in `_pending_live_init` after a failed query, `api_query_lock_status` (senddata) is called again on every 30-second poll — making the lock beep constantly and leaving its `is_locked` field unpopulated (showing as unavailable in HA).
+
+### 7. Optimistic state updates after commands
 
 When the hub firmware is too old for `cachedstatus`, polling returns no new state. After a lock or unlock command succeeds, the coordinator immediately updates `self.data` via `async_set_updated_data()` so HA entities reflect the new state without waiting for the next poll cycle.
 
