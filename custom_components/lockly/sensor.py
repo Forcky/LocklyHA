@@ -37,6 +37,17 @@ def _voltage_to_pct(raw: int) -> int:
     return max(0, min(100, round(pct)))
 
 
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    coordinator: LocklyCoordinator = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities(
+        LocklyBatterySensor(coordinator, lock) for lock in coordinator.locks
+    )
+
+
 def _lock_display_name(lock_data: dict, lock_id: str) -> str:
     return lock_data.get("na") or lock_data.get("blename") or lock_id
 

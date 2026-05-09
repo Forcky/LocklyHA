@@ -25,8 +25,9 @@ This document describes the Lockly cloud API as reverse-engineered from the Lock
 15. [Token Refresh](#15-token-refresh)
 16. [Lock Data Fields Reference](#16-lock-data-fields-reference)
 17. [Endpoint Quick Reference](#17-endpoint-quick-reference)
-18. [CRC-8 Algorithm](#18-crc-8-algorithm)
-19. [Reverse Engineering Notes](#19-reverse-engineering-notes)
+18. [Error Codes](#18-error-codes)
+19. [CRC-8 Algorithm](#19-crc-8-algorithm)
+20. [Reverse Engineering Notes](#20-reverse-engineering-notes)
 
 ---
 
@@ -676,7 +677,26 @@ The `mc` (master code) and `ID` (UUID) are the two inputs needed to derive the A
 
 ---
 
-## 18. CRC-8 Algorithm
+## 18. Error Codes
+
+Response codes appear in the `cod` field of all API responses. The `200` success code is a string in some endpoints, an integer in others — always compare as `str(cod) == "200"`.
+
+| Code | Meaning |
+|---|---|
+| `200` | Success |
+| `900` | Hub-level system error — for `cachedstatus`, this means the hub firmware predates the feature |
+| `901` | No lock found |
+| `909` | Server cannot parse request — `para` field missing or not DES3-encrypted |
+| `931` | Secure LINK already bound to another account |
+| `932` | Secure LINK does not exist |
+| `938` | Secure LINK ID coding format error |
+| `942` | MQTT timeout — hub did not receive a BLE response from the lock in time. Transient; retry is safe. Source: `HubBleBuilder` fires this after the MQTT response timer expires with log "MQTT超时" |
+| `943` | Hub is offline (app falls back to direct Bluetooth) |
+| `990` | General system error / poor network |
+
+---
+
+## 19. CRC-8 Algorithm
 
 Lockly uses a non-standard CRC-8 implemented in `CrcUtils.java`. Lookup table (only 16 entries — processes 4 bits at a time):
 
@@ -695,7 +715,7 @@ The CRC covers all bytes of the frame **including** the type byte, but **excludi
 
 ---
 
-## 19. Reverse Engineering Notes
+## 20. Reverse Engineering Notes
 
 ### Methodology
 

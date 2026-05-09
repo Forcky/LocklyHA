@@ -234,7 +234,8 @@ def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
     try:
         payload = bytes.fromhex(payload_hex)
         if len(payload) % 16 != 0:
-            _LOGGER.warning("ACK payload not AES-aligned: %d bytes", len(payload))
+            # Short/misaligned payload means the lock sent an error/nack frame.
+            _LOGGER.debug("ACK payload not AES-aligned (%d bytes) — lock returned error/nack", len(payload))
             return {}
         decrypted = AES.new(aes_key, AES.MODE_ECB).decrypt(payload)
         d = decrypted.rstrip(b"\x00").hex()

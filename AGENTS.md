@@ -192,6 +192,7 @@ Do not store coordinator data in entity instance variables — always re-read fr
 | `909` | Server cannot parse request — usually means `para` field is missing or unencrypted |
 | `900` | Hub-level system error — for `cachedstatus` this means hub firmware is too old |
 | `901` | No lock found |
+| `942` | MQTT timeout — hub did not receive a BLE response from the lock in time ("Poor Internet Connection"). Transient; safe to retry. |
 
 ---
 
