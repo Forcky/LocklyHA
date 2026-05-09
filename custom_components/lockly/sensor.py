@@ -43,9 +43,11 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: LocklyCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
-        LocklyBatterySensor(coordinator, lock) for lock in coordinator.locks
-    )
+    entities = []
+    for lock in coordinator.locks:
+        entities.append(LocklyBatterySensor(coordinator, lock))
+        entities.append(LocklyLastAccessSensor(coordinator, lock))
+    async_add_entities(entities)
 
 
 def _lock_display_name(lock_data: dict, lock_id: str) -> str:
@@ -110,3 +112,45 @@ class LocklyBatterySensor(CoordinatorEntity, SensorEntity):
         if d.get("battery_invalid"):
             attrs["battery_invalid"] = True
         return attrs
+
+
+class LocklyLastAccessSensor(CoordinatorEntity, SensorEntity):
+    """Shows who most recently accessed the lock and when."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Last Access"
+    _attr_icon = "mdi:account-clock"
+
+    def __init__(self, coordinator: LocklyCoordinator, lock: dict) -> None:
+        super().__init__(coordinator)
+        lock_id = lock["ID"]
+        self._lock_id = lock_id
+        self._attr_unique_id = f"lockly_{lock_id}_last_access"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, lock_id)},
+            name=_lock_display_name(lock, lock_id),
+            manufacturer="Lockly",
+            model=lock.get("lockType") or "Smart Lock",
+        )
+
+    @property
+    def _lock_data(self) -> dict:
+        return self.coordinator.data.get(self._lock_id, {})
+
+    @property
+    def native_value(self) -> str | None:
+        event = self._lock_data.get("last_access_event")
+        if event is None:
+            return None
+        return event.get("lockUserName") or event.get("userName") or "Unknown"
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        event = self._lock_data.get("last_access_event")
+        if not event:
+            return {}
+        return {
+            "event_type": event.get("eventType") or event.get("type") or "UNKNOWN",
+            "timestamp": event.get("timestamp") or event.get("time"),
+            "event_id": event.get("eventId") or event.get("id"),
+        }

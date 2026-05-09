@@ -516,3 +516,176 @@ async def api_lock(
     return await _api_send_directive(
         session, jwt, email, des3_key, lock, "L", build_lock_cmd(mc, lock["ID"])
     )
+
+
+# ── Access log ────────────────────────────────────────────────────────────────
+
+async def api_get_lock_history(
+    session: aiohttp.ClientSession,
+    jwt: str,
+    des3_key: bytes,
+    email: str,
+    lock_id: str,
+    since_ms: int,
+) -> tuple[list[dict], int] | None:
+    """Fetch access log events since since_ms (epoch ms).
+
+    Returns (events, last_sync_time_ms) or None on failure.
+    events is the raw 'el' list from HistoryQueryBean.
+    last_sync_time_ms should be saved and passed back as since_ms next call.
+    Response field names (el, LAST_EVENT_SYNC_TIME) come from HistoryQueryBean
+    in the APK — validate against live hardware on first deploy.
+    """
+    req = {"acct": email, "ID": lock_id, "time": str(since_ms)}
+    para = des3_encrypt(des3_key, json.dumps(req, separators=(",", ":")))
+    try:
+        async with session.post(
+            API_BASE + "getlkhist",
+            json={**COMMON_BODY, "para": para},
+            headers=_headers(jwt),
+        ) as resp:
+            body = await resp.json(content_type=None)
+            if str(body.get("cod")) != "200":
+                _LOGGER.debug("getlkhist failed: cod=%s lock=%s", body.get("cod"), lock_id)
+                return None
+            events = body.get("el") or []
+            last_sync = body.get("LAST_EVENT_SYNC_TIME") or since_ms
+            return list(events), int(last_sync)
+    except Exception:
+        _LOGGER.exception("getlkhist request failed for lock %s", lock_id)
+        return None
+
+
+# ── Guest / access user management ───────────────────────────────────────────
+
+async def api_list_guests(
+    session: aiohttp.ClientSession,
+    jwt: str,
+    des3_key: bytes,
+    lock_id: str,
+    admin_acu_id: int,
+) -> list[dict] | None:
+    """Return guest credential list for a lock, or None on failure.
+
+    Endpoint: POST acu/crdntl/list
+    Each item contains: userAcuId, name, pw (PIN), tp (type), startTime,
+    endTime, acuStatus ("Y"/"S"), guestType.
+    """
+    req = {"dv": lock_id, "adminAcuId": admin_acu_id}
+    para = des3_encrypt(des3_key, json.dumps(req, separators=(",", ":")))
+    try:
+        async with session.post(
+            API_BASE + "acu/crdntl/list",
+            json={**COMMON_BODY, "para": para},
+            headers=_headers(jwt),
+        ) as resp:
+            body = await resp.json(content_type=None)
+            if str(body.get("cod")) != "200":
+                _LOGGER.error("acu/crdntl/list failed: cod=%s lock=%s", body.get("cod"), lock_id)
+                return None
+            return body.get("acuMediumList") or []
+    except Exception:
+        _LOGGER.exception("acu/crdntl/list failed for lock %s", lock_id)
+        return None
+
+
+async def api_add_guest(
+    session: aiohttp.ClientSession,
+    jwt: str,
+    des3_key: bytes,
+    lock_id: str,
+    name: str,
+    passcode: str,
+    start_ms: int,
+    end_ms: int,
+) -> dict | None:
+    """Create a time-limited guest user with a PIN code.
+
+    Returns response body dict (contains userAcuId) on success, None on failure.
+    Endpoint: POST acu/save
+
+    WARNING: whether the passcode auto-activates on the lock hardware after this
+    call is untested. If the guest code does not work physically, call
+    api_activate_passcode() (see stub below) after this returns successfully.
+    """
+    guest_body = {
+        "startTime": start_ms,
+        "endTime": end_ms,
+        "weekData": 0,
+        "pw": passcode,
+        "pid": 1,
+        "pwStatus": "Y",
+        "subadm": "false",
+        "oacpriv": "false",
+    }
+    req = {
+        "dv": lock_id,
+        "name": name,
+        "tp": "GUEST",
+        "userAcuId": 0,
+        "acuStatus": "Y",
+        "timeType": "MORE_LIMIT",
+        "isRetry": False,
+        "multipleVerific": 0,
+        "acuGuest": guest_body,
+    }
+    para = des3_encrypt(des3_key, json.dumps(req, separators=(",", ":")))
+    try:
+        async with session.post(
+            API_BASE + "acu/save",
+            json={**COMMON_BODY, "para": para},
+            headers=_headers(jwt),
+        ) as resp:
+            body = await resp.json(content_type=None)
+            if str(body.get("cod")) != "200":
+                _LOGGER.error("acu/save failed: cod=%s lock=%s", body.get("cod"), lock_id)
+                return None
+            _LOGGER.info(
+                "Guest '%s' created for lock %s — verify PIN activates on lock hardware",
+                name, lock_id,
+            )
+            return body
+    except Exception:
+        _LOGGER.exception("acu/save failed for lock %s", lock_id)
+        return None
+
+
+async def api_delete_guest(
+    session: aiohttp.ClientSession,
+    jwt: str,
+    des3_key: bytes,
+    lock_id: str,
+    user_acu_id: int,
+    admin_acu_id: int,
+) -> bool:
+    """Delete a guest user by userAcuId. Returns True on success."""
+    req = {
+        "dv": lock_id,
+        "userAcuId": user_acu_id,
+        "adminAcuId": admin_acu_id,
+    }
+    para = des3_encrypt(des3_key, json.dumps(req, separators=(",", ":")))
+    try:
+        async with session.post(
+            API_BASE + "acu/delete",
+            json={**COMMON_BODY, "para": para},
+            headers=_headers(jwt),
+        ) as resp:
+            body = await resp.json(content_type=None)
+            if str(body.get("cod")) != "200":
+                _LOGGER.error("acu/delete failed: cod=%s lock=%s", body.get("cod"), lock_id)
+                return False
+            return True
+    except Exception:
+        _LOGGER.exception("acu/delete failed for lock %s", lock_id)
+        return False
+
+
+# async def api_activate_passcode(
+#     session, jwt, des3_key, lock_id: str, user_acu_id: int, pwd_id: int, admin_acu_id: int
+# ) -> bool:
+#     """POST acu/crdntl/pwList/active — pushes a pending PIN to the lock hardware.
+#     para: {"dv": lock_id, "isAdmin": False,
+#            "pwList": [{"userId": user_acu_id, "pid": pwd_id, "adminAcuId": admin_acu_id}]}
+#     Call after api_add_guest() if the passcode does not auto-activate on the lock.
+#     """

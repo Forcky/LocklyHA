@@ -20,7 +20,12 @@ CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 
 SCAN_INTERVAL_SECONDS = 30
+HISTORY_INTERVAL_SECONDS = 300  # 5 minutes — access log poll
 SENDDATA_TIMEOUT = 30
+
+SERVICE_LIST_GUESTS  = "list_guests"
+SERVICE_ADD_GUEST    = "add_guest"
+SERVICE_DELETE_GUEST = "delete_guest"
 
 BATTERY_MIN_V = 4.5
 BATTERY_MAX_V = 6.0
