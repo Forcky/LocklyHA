@@ -18,7 +18,8 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 | Lock / Unlock from HA | ✅ |
 | Real-time lock state (locked / unlocked) | ✅ |
 | Battery low warning | ✅ |
-| Door sensor state (if fitted) | ✅ |
+| Door sensor state (if fitted) | 🚧 In progress |
+| Last access / who entered | 🚧 In progress |
 | Multiple locks per account | ✅ |
 | Silent polling — lock does not beep during polls | ✅ |
 | Config flow UI | ✅ |
