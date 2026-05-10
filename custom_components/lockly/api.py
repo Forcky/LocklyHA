@@ -152,11 +152,15 @@ def build_ble_frame(payload: bytes, type_byte: int) -> bytes:
     return frame_no_crc + bytes([crc8_lockly(frame_no_crc)])
 
 
-def _build_cmd_hex(cmd_code: str, master_code: str, uuid: str, extra_fields: str = "") -> str:
+def _build_cmd_hex(cmd_code: str, master_code: str, uuid: str, lock_pwd: str = "") -> str:
     """Build an AES-encrypted BLE command hex string.
 
     Command content (NewUnlockCmd AES path):
-      cmd_code + mc_len + enc_mc + "02" + pwd_id("0100") + extra_fields + time_hex + "01"
+      cmd_code + mc_len + enc_mc + unlock_type("02") + pwd_expanded + pwd_id("0100") + time_hex + isHub("01")
+
+    pwd_expanded = HexUtils.m86803d(lock_pwd): prepend "0" before each char of lock_pwd.
+    For admin remote unlock, lock_pwd is the "hc" field from BackupLockBean (getLockPwd()).
+    Example: "980798" -> "090800070908" (6 bytes).
     """
     enc_mc = encrypt_master_code(master_code, uuid)
     mc_len = f"{len(enc_mc) // 2:02x}"
@@ -166,7 +170,8 @@ def _build_cmd_hex(cmd_code: str, master_code: str, uuid: str, extra_fields: str
     time_str = now.strftime("%y%m%d%H%M%S")
     time_hex = "".join(f"{int(time_str[i:i+2]):02x}" for i in range(0, 12, 2))
 
-    raw = cmd_code + mc_len + enc_mc + "02" + "0100" + extra_fields + time_hex + "01"
+    pwd_expanded = "".join("0" + c for c in str(lock_pwd)) if lock_pwd else ""
+    raw = cmd_code + mc_len + enc_mc + "02" + pwd_expanded + "0100" + time_hex + "01"
     byte_len = len(raw) // 2
     remainder = byte_len % 16
     padding = "" if remainder == 0 else "00" * (16 - remainder)
@@ -207,18 +212,22 @@ def build_query_status_cmd(master_code: str, uuid: str) -> str:
     return build_ble_frame(encrypted, type_byte).hex().upper()
 
 
-def build_unlock_cmd(master_code: str, uuid: str) -> str:
-    """Build NewUnlock BLE command hex (cmd_code "22", unlock type "02")."""
-    return _build_cmd_hex("22", master_code, uuid)
+def build_unlock_cmd(master_code: str, uuid: str, lock_pwd: str = "") -> str:
+    """Build NewUnlock BLE command hex (cmd_code "22", unlock type "02").
 
-
-def build_lock_cmd(master_code: str, uuid: str) -> str:
-    """Build NewLock BLE command hex (same frame as unlock; directive "L" signals intent).
-
-    NewLockCmd uses the same "22" command frame as NewUnlockCmd per APK analysis.
-    The server/hub interprets the directive field to determine lock vs unlock.
+    lock_pwd must be the "hc" field from BackupLockBean (getLockPwd()) so the
+    lock can verify the command.  Omitting it causes a silent NACK from the lock.
     """
-    return _build_cmd_hex("22", master_code, uuid)
+    return _build_cmd_hex("22", master_code, uuid, lock_pwd)
+
+
+def build_lock_cmd(master_code: str, uuid: str, lock_pwd: str = "") -> str:
+    """Build NewLock BLE command hex (same frame as unlock; directive "lock" signals intent).
+
+    NewLockCmd reuses NewUnlockCmd's frame per APK analysis (NewLockCmd.execute calls
+    newUnlockCmd.getDataForHub).  lock_pwd must be the "hc" field (getLockPwd()).
+    """
+    return _build_cmd_hex("22", master_code, uuid, lock_pwd)
 
 
 def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
@@ -489,8 +498,10 @@ async def _api_send_directive(
         ) as resp:
             body = await resp.json(content_type=None)
             cod = str(body.get("cod"))
+            ack = body.get("ACK", "")
             _LOGGER.debug(
-                "senddata directive=%s cod=%s lock=%s", directive, cod, lock.get("blename")
+                "senddata directive=%s cod=%s ack=%s lock=%s",
+                directive, cod, ack[:20] if ack else "(none)", lock.get("blename"),
             )
             return cod == "200"
     except Exception:
@@ -509,8 +520,10 @@ async def api_unlock(
 ) -> bool:
     """Send unlock command. Returns True if server acknowledged."""
     mc = str(lock["mc"])
+    lock_pwd = str(lock.get("hc") or "")
     return await _api_send_directive(
-        session, jwt, email, des3_key, lock, "unlock", build_unlock_cmd(mc, lock["ID"])
+        session, jwt, email, des3_key, lock, "unlock",
+        build_unlock_cmd(mc, lock["ID"], lock_pwd),
     )
 
 
@@ -523,8 +536,10 @@ async def api_lock(
 ) -> bool:
     """Send lock command. Returns True if server acknowledged."""
     mc = str(lock["mc"])
+    lock_pwd = str(lock.get("hc") or "")
     return await _api_send_directive(
-        session, jwt, email, des3_key, lock, "lock", build_lock_cmd(mc, lock["ID"])
+        session, jwt, email, des3_key, lock, "lock",
+        build_lock_cmd(mc, lock["ID"], lock_pwd),
     )
 
 

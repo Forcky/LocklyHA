@@ -184,6 +184,7 @@ The `lock` dict (from `coordinator.locks`) contains decoded `BackupLockBean` JSO
 | `na` | `"Front Door"` | User-set display name |
 | `blename` | `"LOCKLYAA009868"` | BLE advertisement name (fallback display name) |
 | `mc` | `24860092` | Master code — AES key derivation and BLE frame content |
+| `hc` | `"980798"` | Lock password (`BackupLockBean.lockPwd`, Java: `getLockPwd()`) — **required** in the "22" BLE frame as `m86803d(hc)` (interleaved: `"0"+digit` per char). Without it the lock sends a silent NACK. |
 | `hubid` | `"PGH220UG2082979T"` | Hub serial — required in `senddata` and `cachedstatus` requests |
 | `iotdm` | `"M2T200438609"` | Aliyun IoT device model — `mdna` field in `senddata` |
 | `lockType` | `"PGD628FN"` | Hardware model code — shown in HA device info |
