@@ -265,20 +265,30 @@ def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
 
 
 # ── Cached status bit masks (HubCacheStatusData) ─────────────────────────────
-# bit 0 (=1)  LOCK_STATUS_BIT  : 0=locked, 1=unlocked
-# bit 1 (=2)  HAS_WIRED_DS_BIT : wired door sensor present
-# bit 2 (=4)  WIRED_DS_STATUS  : wired door sensor open
-# bit 3 (=8)  HAS_RF_DS_BIT    : RF door sensor present
-# bit 4 (=16) HAS_RF_STATUS    : RF door sensor open
-# bit 7 (=128) LOW_BAT_BIT     : low battery
+# bit 0 (=1)   LOCK_STATUS_BIT  : 0=locked, 1=unlocked
+# bit 1 (=2)   HAS_WIRED_DS_BIT : wired door sensor present
+# bit 2 (=4)   WIRED_DS_STATUS  : wired door sensor open
+# bit 3 (=8)   HAS_RF_DS_BIT    : RF door sensor present
+# bit 4 (=16)  RF_DS_STATUS     : RF door sensor open
+# bit 7 (=128) LOW_BAT_BIT      : low battery
 
 
 def parse_cached_status(sts: int) -> dict[str, Any]:
     """Parse the `sts` integer from lock/cachedstatus/get response."""
+    wired = bool(sts & 2)
+    rf = bool(sts & 8)
+    if wired:
+        door_open: bool | None = bool(sts & 4)
+    elif rf:
+        door_open = bool(sts & 16)
+    else:
+        door_open = None
     return {
         "is_locked": not bool(sts & 1),
         "low_battery": bool(sts & 128),
-        "door_sensor_open": bool(sts & 4) if (sts & 2) else None,
+        "door_sensor_open": door_open,
+        "wired_door_sensor_connected": wired,
+        "rf_door_sensor_connected": rf,
     }
 
 
@@ -500,7 +510,7 @@ async def api_unlock(
     """Send unlock command. Returns True if server acknowledged."""
     mc = str(lock["mc"])
     return await _api_send_directive(
-        session, jwt, email, des3_key, lock, "U", build_unlock_cmd(mc, lock["ID"])
+        session, jwt, email, des3_key, lock, "unlock", build_unlock_cmd(mc, lock["ID"])
     )
 
 
@@ -514,7 +524,7 @@ async def api_lock(
     """Send lock command. Returns True if server acknowledged."""
     mc = str(lock["mc"])
     return await _api_send_directive(
-        session, jwt, email, des3_key, lock, "L", build_lock_cmd(mc, lock["ID"])
+        session, jwt, email, des3_key, lock, "lock", build_lock_cmd(mc, lock["ID"])
     )
 
 

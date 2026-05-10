@@ -61,7 +61,16 @@ HA                 LocklyCoordinator            api.py                  Lockly C
 
 ## Critical invariants — read before changing anything
 
-### 1. Never call `senddata` in a polling loop
+### 1. `directive` field values are lowercase strings
+
+The `senddata` request's `directive` field uses **`"unlock"`** and **`"lock"`** (lowercase), not `"U"`/`"L"` or `"UNLOCK"`/`"LOCK"`. These are defined as constants in `SendDataReq.java`:
+```java
+public static final String LOCK = "lock";
+public static final String UNLOCK = "unlock";
+```
+Using any other value causes the server to accept the request (cod=200) but the hub/lock does nothing.
+
+### 2. Never call `senddata` in a polling loop
 
 `senddata` relays a BLE frame from the hub to the physical lock. The lock **beeps** when it receives a BLE frame. Calling `senddata` every 30 seconds (the poll interval) will make every lock in the house beep constantly.
 
