@@ -1,10 +1,10 @@
 {
   "domain": "lockly",
   "name": "Lockly",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "documentation": "https://github.com/Forcky/LocklyHA",
   "issue_tracker": "https://github.com/Forcky/LocklyHA/issues",
-  "requirements": ["pycryptodome>=3.9.0"],
+  "requirements": ["pycryptodome>=3.9.0", "paho-mqtt>=1.6.0"],
   "dependencies": [],
   "codeowners": ["@Forcky"],
   "iot_class": "cloud_polling",

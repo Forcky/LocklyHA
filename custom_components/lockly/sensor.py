@@ -142,7 +142,7 @@ class LocklyLastAccessSensor(CoordinatorEntity, SensorEntity):
         event = self._lock_data.get("last_access_event")
         if event is None:
             return None
-        return event.get("lockUserName") or event.get("userName") or "Unknown"
+        return event.get("na") or "Unknown"
 
     @property
     def extra_state_attributes(self) -> dict:
@@ -150,7 +150,7 @@ class LocklyLastAccessSensor(CoordinatorEntity, SensorEntity):
         if not event:
             return {}
         return {
-            "event_type": event.get("eventType") or event.get("type") or "UNKNOWN",
-            "timestamp": event.get("timestamp") or event.get("time"),
-            "event_id": event.get("eventId") or event.get("id"),
+            "event_type": event.get("co") or "UNKNOWN",
+            "timestamp": event.get("tm"),
+            "event_id": event.get("id"),
         }

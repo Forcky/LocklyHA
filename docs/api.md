@@ -22,12 +22,15 @@ This document describes the Lockly cloud API as reverse-engineered from the Lock
 12. [NewLock Command](#12-newlock-command)
 13. [Live Status — senddata Endpoint](#13-live-status--senddata-endpoint)
 14. [Silent Status — lock/cachedstatus/get Endpoint](#14-silent-status--lockcachedstatusget-endpoint)
-15. [Token Refresh](#15-token-refresh)
-16. [Lock Data Fields Reference](#16-lock-data-fields-reference)
-17. [Endpoint Quick Reference](#17-endpoint-quick-reference)
-18. [Error Codes](#18-error-codes)
-19. [CRC-8 Algorithm](#19-crc-8-algorithm)
-20. [Reverse Engineering Notes](#20-reverse-engineering-notes)
+15. [Access Log — getlkhist Endpoint](#15-access-log--getlkhist-endpoint)
+16. [Guest Management — acu/ Endpoints](#16-guest-management--acu-endpoints)
+17. [MQTT Real-Time Push](#17-mqtt-real-time-push)
+18. [Token Refresh](#18-token-refresh)
+19. [Lock Data Fields Reference](#19-lock-data-fields-reference)
+20. [Endpoint Quick Reference](#20-endpoint-quick-reference)
+21. [Error Codes](#21-error-codes)
+22. [CRC-8 Algorithm](#22-crc-8-algorithm)
+23. [Reverse Engineering Notes](#23-reverse-engineering-notes)
 
 ---
 
@@ -630,7 +633,205 @@ door_sensor_open = bool(sts & 0x04) if (sts & 0x02) else None
 
 ---
 
-## 15. Token Refresh
+## 15. Access Log — getlkhist Endpoint
+
+Returns the access event history for a lock (physical unlocks, lock events, denied attempts) since a given timestamp cursor.
+
+### Request
+
+```
+POST /pgsmtlkv2/api/getlkhist
+Authorization: Bearer <jwt>
+```
+
+Body:
+```json
+{
+  ...common_body...,
+  "para": "<base64(DES3_ECB_encrypt({'acct': email, 'ID': lock_id, 'time': str(since_ms)}))>"
+}
+```
+
+| Field | Description |
+|---|---|
+| `acct` | Account email |
+| `ID` | Lock device UUID (24 hex chars) |
+| `time` | Cursor: epoch ms of last fetched event as a string (pass `"0"` for all history) |
+
+### Response
+
+```json
+{
+  "cod": "200",
+  "el": [ ... ],
+  "LAST_EVENT_SYNC_TIME": 1715123456789
+}
+```
+
+| Field | Description |
+|---|---|
+| `el` | Event list — array of `HistoryUploadRequest.OpenLock` objects |
+| `LAST_EVENT_SYNC_TIME` | Cursor for next call — save and pass as `time` on the next request |
+
+Save `LAST_EVENT_SYNC_TIME` and pass it as `time` on the next call to receive only new events.
+
+### Event object fields (`el[]`)
+
+Fields are the raw Java field names from `HistoryUploadRequest.OpenLock` — there are **no** `@SerializedName` annotations; the short names are the JSON keys.
+
+| JSON key | Type | Meaning |
+|---|---|---|
+| `co` | string | Event type (e.g. `"UNLOCK"`, `"LOCK"`, `"ACCESS_DENIED"`) |
+| `tm` | long | Timestamp in epoch ms |
+| `na` | string | Operator name — empty for anonymous keypad/fingerprint entries |
+| `id` | long | Lock record ID (use for deduplication) |
+| `pid` | int | Credential slot / keypad ID used |
+| `logVer` | int | Log version |
+
+**Important:** Do not use `eventType`, `lockUserName`, `timestamp`, `eventId`, etc. — those names do not exist in the serialised JSON.
+
+---
+
+## 16. Guest Management — acu/ Endpoints
+
+All three endpoints use DES3/ECB-encrypted `para` (§6) and require a valid JWT.
+
+### List guests — acu/crdntl/list
+
+```
+POST /pgsmtlkv2/api/acu/crdntl/list
+```
+
+Inner para JSON:
+```json
+{"dv": "<lock_id>", "adminAcuId": <admin_acu_id>}
+```
+
+`adminAcuId` is the integer from the `adminAcuId` field in `BackupLockBean` (§19).
+
+Response (cod=200):
+```json
+{"cod": "200", "acuMediumList": [ ... ]}
+```
+
+Each item contains: `userAcuId`, `name`, `startTime`, `endTime`, `acuStatus` (`"Y"` = active, `"S"` = suspended).
+
+### Add guest — acu/save
+
+```
+POST /pgsmtlkv2/api/acu/save
+```
+
+Inner para JSON:
+```json
+{
+  "dv": "<lock_id>",
+  "name": "Guest Name",
+  "type": "GUEST",
+  "userAcuId": 0,
+  "acuStatus": "Y",
+  "timeType": "MORE_LIMIT",
+  "isRetry": false,
+  "multipleVerific": 0,
+  "acuGuest": {
+    "startTime": <epoch_ms>,
+    "endTime":   <epoch_ms>,
+    "weekData":  0,
+    "pw":        "1234",
+    "pid":       1,
+    "pwStatus":  "Y",
+    "subadm":    "false",
+    "oacpriv":   "false"
+  }
+}
+```
+
+**Critical field name:** the user type key is `"type"` (from `@SerializedName(Constants.OMK_TYPE)` where `Constants.OMK_TYPE = "type"`). Using `"tp"` instead will silently fail (cod=200 but wrong behaviour).
+
+Response contains `userAcuId` for the new guest — save it for deletion.
+
+> **Known limitation:** Whether `acu/save` auto-activates the PIN on the physical lock hardware is unconfirmed. If the PIN does not work physically, call `acu/crdntl/pwList/active` (see stub comment in `api.py`) after saving.
+
+### Delete guest — acu/delete
+
+```
+POST /pgsmtlkv2/api/acu/delete
+```
+
+Inner para JSON:
+```json
+{"dv": "<lock_id>", "userAcuId": <user_acu_id>, "adminAcuId": <admin_acu_id>}
+```
+
+Response: `{"cod": "200"}` on success.
+
+---
+
+## 17. MQTT Real-Time Push
+
+The Lockly mobile app receives real-time lock state changes via a Paho MQTT connection to a Lockly-operated broker. The HA integration replicates this to get push updates without polling.
+
+### Broker
+
+```
+ssl://mqttuswest02-lb-001-b5ed8c5e37b3a497.elb.us-west-2.amazonaws.com:8883
+```
+
+Extracted from `PgConfig.smali` in the APK. Standard MQTT over TLS; port 8883.
+
+### Authentication
+
+| MQTT field | Value |
+|---|---|
+| `client_id` | Any random UUID (generate fresh at startup) |
+| `username` | Account email (lowercase) |
+| `password` | JWT bearer token (without the `Bearer ` prefix) |
+
+The app's `MqttConnectionOption.getUserName()` returns `{user_client_id}_{email}` when a server-assigned `user_client_id` is stored in SharedPreferences, or falls back to just the email. For HA, the email-only fallback is used.
+
+### Topic
+
+Subscribe to topic `"server"`. All messages use this single topic; message type is identified by `header.name` in the JSON payload.
+
+### Message format
+
+```json
+{
+  "header": {
+    "name": "deviceStateCallback"
+  },
+  "items": [
+    {
+      "deviceId": "2d0023003030471333363838",
+      "states": [
+        {"statusKey": "LOCKED_STATUS", "statusValue": "0"},
+        {"statusKey": "MAGNET",        "statusValue": "0"}
+      ]
+    }
+  ]
+}
+```
+
+| `header.name` | Meaning |
+|---|---|
+| `deviceStateCallback` | Lock/door state changed |
+| `lockCommandResponse` | Response to a lock/unlock command sent via MQTT |
+| `lockEventLogQueryResponse` | Access log event delivered in real time |
+
+**State keys:**
+
+| `statusKey` | `statusValue` |
+|---|---|
+| `LOCKED_STATUS` | `"0"` = unlocked, `"1"` = locked |
+| `MAGNET` | `"0"` = door closed, `"1"` = door open |
+
+### Note on Aliyun IoT
+
+Each lock's `BackupLockBean` contains `iothost`, `iotdm`, `iotsecret`, `iotprodkey` — these are the **hub's Aliyun IoT** device credentials. **Do not connect the HA integration to Aliyun IoT using these credentials.** Doing so would connect with the same device identity as the hub, disconnecting the hub from the Aliyun broker and breaking the BLE relay for lock commands.
+
+---
+
+## 18. Token Refresh
 
 ```
 POST /pgsmtlkv2/api/refresh
@@ -643,7 +844,7 @@ The new JWT is returned in the response `Authorization` header, identical to log
 
 ---
 
-## 16. Lock Data Fields Reference
+## 19. Lock Data Fields Reference
 
 Fields in the `BackupLockBean` JSON returned by `qrylknew` (decrypted from `dl[]`):
 
@@ -653,9 +854,13 @@ Fields in the `BackupLockBean` JSON returned by `qrylknew` (decrypted from `dl[]
 | `na` | `lockName` | string | **User-set friendly name** (e.g. "Front Door") |
 | `blename` | `bleName` | string | BLE advertisement name (e.g. "LOCKLYAA009868") |
 | `mc` | `masterCode` | int | Master code for AES key derivation |
+| `hc` | `lockPwd` (`getLockPwd()`) | string | Lock admin password — required in the "22" BLE frame; without it the lock sends a silent NACK |
 | `hubid` | `hubId` | string | Hub serial number (e.g. "PGH220UG2059895T") |
-| `iotdm` | `iotDeviceModel` | string | Aliyun IoT device name (e.g. "M2T200434555") |
-| `iotprodkey` | `iotProductKey` | string | Aliyun IoT product key |
+| `iotdm` | `iotDeviceModel` | string | Aliyun IoT device name used as `mdna` in `senddata` (e.g. "M2T200434555") |
+| `iotprodkey` | `iotProductKey` | string | Aliyun IoT product key — do not use for direct MQTT connection from HA |
+| `iothost` | `iothost` | string | Aliyun IoT broker hostname — hub's device identity; do not connect HA using these credentials |
+| `iotsecret` | `deviceSecret` | string | Aliyun IoT HMAC secret — hub credential only |
+| `adminAcuId` | `adminAcuId` | int | Admin ACU ID — required for `acu/crdntl/list` and `acu/delete` |
 | `status` | `status` | int | Last known lock status from cloud |
 | `pcStatus` | `pcStatus` | int | Power/charge status |
 | `dn` | `deviceName` | string | Alternative device name |
@@ -665,7 +870,7 @@ The `mc` (master code) and `ID` (UUID) are the two inputs needed to derive the A
 
 ---
 
-## 17. Endpoint Quick Reference
+## 20. Endpoint Quick Reference
 
 | Endpoint | Auth | Encryption | Purpose |
 |---|---|---|---|
@@ -674,10 +879,14 @@ The `mc` (master code) and `ID` (UUID) are the two inputs needed to derive the A
 | `qrylknew` | Bearer JWT | RSA (para) + DES3 (response) | Get lock list + DES3 key |
 | `senddata` | Bearer JWT | DES3 (para) + AES (BLE) | Live lock query / lock / unlock |
 | `lock/cachedstatus/get` | Bearer JWT | DES3 (para) | Silent cached status (hub firmware ≥ 422 required) |
+| `getlkhist` | Bearer JWT | DES3 (para) | Access log events since cursor |
+| `acu/crdntl/list` | Bearer JWT | DES3 (para) | List guest PIN credentials |
+| `acu/save` | Bearer JWT | DES3 (para) | Create guest with time-limited PIN |
+| `acu/delete` | Bearer JWT | DES3 (para) | Delete guest by userAcuId |
 
 ---
 
-## 18. Error Codes
+## 21. Error Codes
 
 Response codes appear in the `cod` field of all API responses. The `200` success code is a string in some endpoints, an integer in others — always compare as `str(cod) == "200"`.
 
@@ -696,7 +905,7 @@ Response codes appear in the `cod` field of all API responses. The `200` success
 
 ---
 
-## 19. CRC-8 Algorithm
+## 22. CRC-8 Algorithm
 
 Lockly uses a non-standard CRC-8 implemented in `CrcUtils.java`. Lookup table (only 16 entries — processes 4 bits at a time):
 
@@ -715,7 +924,7 @@ The CRC covers all bytes of the frame **including** the type byte, but **excludi
 
 ---
 
-## 20. Reverse Engineering Notes
+## 23. Reverse Engineering Notes
 
 ### Methodology
 
@@ -742,6 +951,9 @@ The CRC covers all bytes of the frame **including** the type byte, but **excludi
 ### Known unknowns
 
 - The `asyncsend` endpoint (async alternative to `senddata`) exists but is not used by this integration. The request format appears identical; the response is a callback rather than a synchronous ACK.
-- **MPPS push channel** — the Lockly app subscribes to a push channel per lock at `apiserv04c.lockly.com/mpps/v1/channel` (GET to list channels, POST to manage subscriptions). The channel names are the lock UUIDs (e.g. `2D0023003030471333363838`). When the lock state changes, a push notification is delivered to these channels. Implementing this push subscription in HA would provide real-time state updates without any polling or BLE commands. The Aliyun IoT MQTT path (`iotdm`, `iotprodkey`) appears to be an alternative push mechanism for older firmware.
+- **MQTT username format** — the broker may require `{user_client_id}_{email}` rather than just the email. The `user_client_id` is a server-assigned ID stored in app SharedPreferences under `user_client_id_1208`. The HA integration uses email-only as the fallback codepath from `MqttConnectionOption.getUserName()`, but this has not been verified against a live MQTT session.
+- **MQTT topic name on broker** — `"server"` is the default `Message.TOPIC` value in the APK. If the broker routes to per-device topics instead, the subscription will receive no messages. Subscribe to `#` with debug logging enabled on first deployment to confirm topic routing.
+- **Guest PIN hardware activation** — whether `acu/save` auto-pushes the PIN to the lock hardware or whether a separate `acu/crdntl/pwList/active` call is required has not been confirmed by live testing.
+- **MPPS REST channel** — `apiserv04c.lockly.com/mpps/v1/channel` manages which channels an FCM-registered device subscribes to. This path requires Firebase Cloud Messaging and is not usable in HA. The Lockly Paho MQTT broker (§17) is the correct path for HA real-time push.
 - Some Lockly hardware generations use an older BLE command set (command `7` = `HostUnlockCmd`). The integration targets AES-capable locks (command `22` = `NewUnlockCmd`); older locks are untested.
 - The `lock/cachedstatus/get` response `time` field is a Unix timestamp in milliseconds. Values of 0 indicate the hub has never uploaded state for this lock.

@@ -25,6 +25,7 @@ from .api import (
     api_query_lock_status,
     api_unlock,
 )
+from .mqtt import LocklyMQTTManager
 from .const import (
     CONF_EMAIL,
     CONF_PASSWORD,
@@ -54,6 +55,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     coordinator.async_start_history_polling()
+    coordinator._mqtt_manager = LocklyMQTTManager(hass, coordinator)
+    await coordinator._mqtt_manager.async_start()
     _register_services(hass, coordinator)
     return True
 
@@ -213,27 +216,32 @@ class LocklyCoordinator(DataUpdateCoordinator):
             if new_cursor > since_ms:
                 self._history_cursors[lock_id] = new_cursor
             for event in events:
+                _LOGGER.debug("lockly history event raw: %s", event)
                 self.hass.bus.async_fire(
                     "lockly_lock_event",
                     {
                         "lock_id": lock_id,
                         "lock_name": lock.get("na") or lock.get("blename") or lock_id,
-                        "event_type": event.get("eventType") or event.get("type") or "UNKNOWN",
-                        "user_id": str(event.get("userId") or event.get("uid") or ""),
-                        "user_name": event.get("lockUserName") or event.get("userName") or "",
-                        "timestamp": event.get("timestamp") or event.get("time") or 0,
-                        "event_id": event.get("eventId") or event.get("id") or 0,
+                        "event_type": event.get("co") or "UNKNOWN",
+                        "user_id": str(event.get("pid") or ""),
+                        "user_name": event.get("na") or "",
+                        "timestamp": event.get("tm") or 0,
+                        "event_id": event.get("id") or 0,
                     },
                 )
             # Update last_access_event on coordinator data so the sensor reflects it.
+            # Use the event with the largest tm value (getlkhist returns oldest-first).
             if events and self.data and lock_id in self.data:
+                latest = max(events, key=lambda e: e.get("tm", 0))
                 updated = {
                     **self.data,
-                    lock_id: {**self.data[lock_id], "last_access_event": events[-1]},
+                    lock_id: {**self.data[lock_id], "last_access_event": latest},
                 }
                 self.async_set_updated_data(updated)
 
     async def async_shutdown(self) -> None:
+        if hasattr(self, "_mqtt_manager"):
+            await self._mqtt_manager.async_stop()
         for cancel in self._history_cancel:
             cancel()
         self._history_cancel.clear()

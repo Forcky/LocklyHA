@@ -187,6 +187,10 @@ The `lock` dict (from `coordinator.locks`) contains decoded `BackupLockBean` JSO
 | `hc` | `"980798"` | Lock password (`BackupLockBean.lockPwd`, Java: `getLockPwd()`) — **required** in the "22" BLE frame as `m86803d(hc)` (interleaved: `"0"+digit` per char). Without it the lock sends a silent NACK. |
 | `hubid` | `"PGH220UG2082979T"` | Hub serial — required in `senddata` and `cachedstatus` requests |
 | `iotdm` | `"M2T200438609"` | Aliyun IoT device model — `mdna` field in `senddata` |
+| `iothost` | `"a1GuxeFynXG.iot-as-mqtt.us-west-1.aliyuncs.com"` | Aliyun IoT broker hostname (per-hub Aliyun credentials — do NOT connect HA directly, would disconnect the hub) |
+| `iotsecret` | `"2c28eb11..."` | Aliyun IoT device secret — HMAC-SHA256 key for Aliyun auth |
+| `iotprodkey` | `"a1GuxeFynXG"` | Aliyun IoT product key |
+| `adminAcuId` | `1234567` | Admin ACU ID — required for guest management API calls |
 | `lockType` | `"PGD628FN"` | Hardware model code — shown in HA device info |
 
 ---
@@ -213,6 +217,37 @@ Do not store coordinator data in entity instance variables — always re-read fr
 
 ---
 
+## Access log event fields
+
+Events returned by `getlkhist` are `HistoryUploadRequest.OpenLock` objects. The JSON keys are the **raw Java field names** — there are no `@SerializedName` annotations, so the keys are short:
+
+| JSON key | Type | Meaning |
+|---|---|---|
+| `co` | string | Event type (lock, unlock, access denied, etc.) |
+| `tm` | long | Timestamp in epoch ms |
+| `na` | string | Operator name — may be empty for anonymous keypad/fingerprint entries |
+| `id` | long | Lock record ID — use for deduplication |
+| `pid` | int | Credential/keypad slot ID used |
+| `logVer` | int | Log version |
+
+Do not use `eventType`, `lockUserName`, `timestamp`, `eventId`, etc. — those are imagined getter names that do not exist in the serialised JSON.
+
+---
+
+## MQTT real-time push
+
+The integration connects to the Lockly Paho MQTT broker at startup (`mqtt.py`):
+- **Broker:** `mqttuswest02-lb-001-b5ed8c5e37b3a497.elb.us-west-2.amazonaws.com:8883` (TLS)
+- **Auth:** username = account email, password = JWT bearer token
+- **Topic:** `"server"` (single topic; filter by `header.name` in each message)
+- **DEVICE_STATE payload:** `{"header": {"name": "deviceStateCallback"}, "items": [{"deviceId": "<lock_id_lowercase>", "states": [{"statusKey": "LOCKED_STATUS", "statusValue": "0|1"}, {"statusKey": "MAGNET", "statusValue": "0|1"}]}]}`
+
+**Do NOT connect to Aliyun IoT** using the per-lock `iothost`/`iotdm`/`iotsecret` fields from BackupLockBean. Those are the hub's device-identity credentials on Aliyun. Connecting with the same clientId as the hub **will disconnect the hub**, breaking the BLE relay for lock commands.
+
+MQTT is additive — if the broker rejects the connection (logged at WARNING), the coordinator continues in polling-only mode without errors.
+
+---
+
 ## Error codes
 
 | Code | Meaning |
@@ -229,6 +264,6 @@ Do not store coordinator data in entity instance variables — always re-read fr
 
 - **Silent polling requires hub firmware build ≥ 422** (major version 2). The tested hub (`PGH220UG2082979T`) runs `2.2.04.17` (build 417) which is 5 builds short.
 - **State staleness on old hubs**: when `cachedstatus` is unsupported, lock state in HA only updates when commanded through HA or when the integration restarts (one-time startup query).
-- **No push/MQTT**: The Lockly app receives real-time state updates via an MPPS push channel (device subscribes to a channel named by lock UUID). This is not implemented; implementing it would solve the staleness issue.
+- **MQTT push requires live verification**: The Lockly Paho broker (`mqtt.py`) connects using JWT auth. The exact username format and topic payload field names were derived from APK analysis but have not been confirmed against a live broker session. If `rc=4` on connect, the username format may need adjustment.
 - **RSA keys are app-version-specific**: embedded keys are from APK 3.2.9. A key rotation by Lockly breaks authentication.
 - **Bluetooth-only locks**: not supported. Requires a PGH-series hub connected to the internet.

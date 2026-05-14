@@ -605,6 +605,7 @@ async def api_list_guests(
             headers=_headers(jwt),
         ) as resp:
             body = await resp.json(content_type=None)
+            _LOGGER.debug("acu/crdntl/list raw response: %s", body)
             if str(body.get("cod")) != "200":
                 _LOGGER.error("acu/crdntl/list failed: cod=%s lock=%s", body.get("cod"), lock_id)
                 return None
@@ -646,7 +647,7 @@ async def api_add_guest(
     req = {
         "dv": lock_id,
         "name": name,
-        "tp": "GUEST",
+        "type": "GUEST",
         "userAcuId": 0,
         "acuStatus": "Y",
         "timeType": "MORE_LIMIT",
@@ -662,6 +663,7 @@ async def api_add_guest(
             headers=_headers(jwt),
         ) as resp:
             body = await resp.json(content_type=None)
+            _LOGGER.debug("acu/save raw response: %s", body)
             if str(body.get("cod")) != "200":
                 _LOGGER.error("acu/save failed: cod=%s lock=%s", body.get("cod"), lock_id)
                 return None

@@ -3,6 +3,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 [![GitHub Release](https://img.shields.io/github/v/release/Forcky/LocklyHA)](https://github.com/Forcky/LocklyHA/releases)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.3.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Control and monitor your **Lockly smart locks** from Home Assistant. This integration communicates with the Lockly cloud API using the same protocol as the official Lockly mobile app.
@@ -20,6 +21,8 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 | Battery low warning | ✅ |
 | Door sensor state (if fitted) | 🚧 In progress |
 | Last access / who entered | 🚧 In progress |
+| Guest PIN management (add / remove / list) | 🚧 In progress |
+| Real-time MQTT push (no-poll state updates) | 🚧 In progress |
 | Multiple locks per account | ✅ |
 | Silent polling — lock does not beep during polls | ✅ |
 | Config flow UI | ✅ |
@@ -61,6 +64,7 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
            ├── const.py
            ├── lock.py
            ├── manifest.json
+           ├── mqtt.py
            ├── sensor.py
            ├── strings.json
            └── translations/
@@ -78,6 +82,26 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 4. Click **Submit**. The integration will log in, discover all locks on your account, and create entities automatically.
 
 Each lock appears as a separate HA device.
+
+---
+
+## Services
+
+### Guest PIN management
+
+Three HA services are available for managing time-limited guest PIN codes. Call them from **Developer Tools → Services** or from automations.
+
+> **Status: 🚧 In progress** — services are implemented but PIN activation on lock hardware is unverified. See [Known Limitations](#known-limitations).
+
+| Service | Required fields | Optional fields |
+|---|---|---|
+| `lockly.list_guests` | `lock_id` | — |
+| `lockly.add_guest` | `lock_id`, `name`, `passcode` (4–8 digits) | `duration_hours` (default 24) **or** `start_time` + `end_time` |
+| `lockly.delete_guest` | `lock_id`, `user_acu_id` | — |
+
+Results are returned as HA bus events: `lockly_guest_list`, `lockly_guest_added`, `lockly_guest_deleted`. Listen for these in **Developer Tools → Events**.
+
+`lock_id` is the device UUID (visible on the lock's device page in HA under *Identifiers*).
 
 ---
 
@@ -136,6 +160,18 @@ Lockly: cachedstatus unsupported for this hub (hub firmware too old) — state w
 
 When you lock or unlock from HA, the integration sends a BLE command through the Lockly cloud and hub to the physical lock. The lock will beep once to acknowledge the command. The lock state in HA updates immediately (optimistically) without waiting for the next poll cycle.
 
+### Access log polling (every 5 minutes)
+
+The integration polls `getlkhist` every 5 minutes for each lock and fires a `lockly_lock_event` HA bus event for each new entry. The event includes `event_type`, `user_name`, `timestamp`, and `event_id`. The **Last Access** sensor on each lock device shows the most recent entry's user name and event details.
+
+> **Status: 🚧 In progress** — event field names have been verified against the APK, but live hardware testing is still required.
+
+### MQTT real-time push (🚧 in progress)
+
+At startup the integration connects to the Lockly cloud MQTT broker using the same JWT used for REST API calls. When the lock state changes (via the official app, keypad, or fingerprint), the broker delivers a push message that updates HA instantly — without waiting for the next 30-second poll.
+
+If the MQTT connection is refused, the integration logs a warning and continues in polling-only mode. No functionality is lost; state updates simply revert to the 30-second interval.
+
 ### Authentication
 
 Credentials (email and password) are stored in HA's config entry. The integration obtains a JWT at startup and automatically re-authenticates when it expires.
@@ -146,8 +182,9 @@ Credentials (email and password) are stored in HA's config entry. The integratio
 
 - **Bluetooth-only locks** (without a PGH hub) are not supported.
 - **Silent polling requires hub firmware build ≥ 422** (for major version 2 hubs). On older firmware, state only updates when commanded through HA or when the integration restarts.
-- **No real-time push updates**: If the lock is physically operated (keypad, fingerprint, app), HA will not reflect the change until the next successful poll or an HA command is sent.
+- **Real-time MQTT push is in progress**: The integration connects to the Lockly MQTT broker at startup using JWT auth. If connection is refused, state updates fall back to the 30-second poll. The exact username format required by the broker has not been verified against a live session; see [Enabling debug logs](#enabling-debug-logs) if MQTT fails to connect.
 - **Battery percentage is approximate** (binary low/normal flag only).
+- **Guest PIN activation is unverified**: `lockly.add_guest` creates the guest record on the Lockly cloud. Whether the PIN is automatically pushed to the lock hardware is not yet confirmed. If the PIN does not work physically, open an issue.
 - **Lock command** (`lock.lock`) has been implemented but not extensively tested across all Lockly hardware generations. If it does not close your lock, please open an issue with your lock model.
 - The Lockly API is undocumented and reverse-engineered. A firmware update by Lockly could break this integration. See [`docs/api.md`](docs/api.md) for the full protocol documentation.
 - The RSA keys embedded in `api.py` are extracted from **Lockly app version 3.2.9**. If Lockly rotates the keys in a later app release, the integration will stop working until updated.
@@ -176,6 +213,19 @@ Credentials (email and password) are stored in HA's config entry. The integratio
 
 **Unlock works but lock does not close the door**
 - Some older Lockly hardware generations may use a different BLE command for locking. Open an issue with your lock's BLE name (shown in the Lockly app) so support can be added.
+
+**Last Access sensor shows "Unknown"**
+- Normal for anonymous keypad entries (no named user assigned to that PIN in the Lockly app). The sensor will show a name once a named user is added in the app.
+
+**`lockly_lock_event` bus events never fire**
+- Access log polling runs every 5 minutes. Wait at least 5 minutes after manually operating the lock.
+- Check HA logs for `getlkhist failed: cod=` lines with debug logging enabled.
+
+**MQTT shows "connection refused" in logs**
+- The MQTT username format or broker address may differ from what was extracted from the APK. Enable debug logging to see the exact error code. The integration continues working in poll-only mode regardless.
+
+**`lockly.add_guest` succeeds but PIN does not work on the lock**
+- The guest record was created on the server but the PIN may not have been pushed to the lock hardware. Open an issue with your lock model so the passcode activation step can be implemented.
 
 **Enabling debug logs**
 
