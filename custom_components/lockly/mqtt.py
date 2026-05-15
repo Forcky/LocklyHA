@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import ssl
 import uuid
 
 import paho.mqtt.client as paho
@@ -67,7 +68,9 @@ class LocklyMQTTManager:
 
         cli = paho.Client(client_id=client_id, protocol=paho.MQTTv311)
         cli.username_pw_set(email, jwt)
-        cli.tls_set()
+        # Lockly's broker presents a self-signed chain; skip verification.
+        cli.tls_set(cert_reqs=ssl.CERT_NONE)
+        cli.tls_insecure_set(True)
         cli.on_connect = on_connect
         cli.on_disconnect = on_disconnect
         cli.on_message = on_message
