@@ -1,0 +1,95 @@
+list_guests:
+  name: List Guests
+  description: >
+    Retrieves the guest list for a Lockly lock and fires a lockly_guest_list
+    event with the results.
+  fields:
+    lock_id:
+      name: Lock ID
+      description: The Lockly lock ID (lockId) to query.
+      required: true
+      example: "ABC123"
+      selector:
+        text:
+
+add_guest:
+  name: Add Guest
+  description: >
+    Adds a guest passcode to a Lockly lock and fires a lockly_guest_added
+    event with the result.
+  fields:
+    lock_id:
+      name: Lock ID
+      description: The Lockly lock ID (lockId) to modify.
+      required: true
+      example: "ABC123"
+      selector:
+        text:
+    name:
+      name: Guest Name
+      description: Display name for the guest.
+      required: true
+      example: "John Doe"
+      selector:
+        text:
+    passcode:
+      name: Passcode
+      description: 4–8 digit numeric passcode for the guest.
+      required: true
+      example: "1234"
+      selector:
+        text:
+    duration_hours:
+      name: Duration (hours)
+      description: >
+        How many hours the passcode is valid (default 24). Ignored when
+        start_time and end_time are both provided.
+      required: false
+      default: 24
+      selector:
+        number:
+          min: 1
+          max: 8760
+          unit_of_measurement: h
+    start_time:
+      name: Start Time
+      description: >
+        UTC datetime when the passcode becomes active. Must be paired with
+        end_time; overrides duration_hours.
+      required: false
+      example: "2026-05-15 08:00:00"
+      selector:
+        datetime:
+    end_time:
+      name: End Time
+      description: >
+        UTC datetime when the passcode expires. Must be paired with start_time.
+      required: false
+      example: "2026-05-16 08:00:00"
+      selector:
+        datetime:
+
+delete_guest:
+  name: Delete Guest
+  description: >
+    Removes a guest passcode from a Lockly lock and fires a
+    lockly_guest_deleted event with the result.
+  fields:
+    lock_id:
+      name: Lock ID
+      description: The Lockly lock ID (lockId) to modify.
+      required: true
+      example: "ABC123"
+      selector:
+        text:
+    user_acu_id:
+      name: User ACU ID
+      description: >
+        The numeric userAcuId of the guest to remove (returned by list_guests
+        via the lockly_guest_list event).
+      required: true
+      example: 42
+      selector:
+        number:
+          min: 1
+          mode: box
