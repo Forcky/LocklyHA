@@ -3,7 +3,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 [![GitHub Release](https://img.shields.io/github/v/release/Forcky/LocklyHA)](https://github.com/Forcky/LocklyHA/releases)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.3.0)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.5.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Control and monitor your **Lockly smart locks** from Home Assistant. This integration communicates with the Lockly cloud API using the same protocol as the official Lockly mobile app.
@@ -16,15 +16,16 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 
 | Feature | Status |
 |---|---|
-| Lock / Unlock from HA | ✅ |
-| Real-time lock state (locked / unlocked) | ✅ |
+| Unlock from HA | ✅ Verified on PGD628FN + PGH220 hub |
+| Lock from HA | 🚧 Implemented; hard to verify on auto-locking locks |
+| Lock state (locked / unlocked) | ✅ At startup and after HA commands |
 | Battery low warning | ✅ |
 | Door sensor state (if fitted) | 🚧 In progress |
 | Last access / who entered | 🚧 In progress |
 | Guest PIN management (add / remove / list) | 🚧 In progress |
-| Real-time MQTT push (no-poll state updates) | 🚧 In progress |
+| Real-time MQTT push (no-poll state updates) | ❌ Broker needs client-certificate auth — see Known Limitations |
 | Multiple locks per account | ✅ |
-| Silent polling — lock does not beep during polls | ✅ |
+| Silent polling — lock does not beep during polls | ⚠️ Needs hub firmware ≥ build 422 |
 | Config flow UI | ✅ |
 | HACS installable | ✅ |
 
@@ -107,7 +108,7 @@ Results are returned as HA bus events: `lockly_guest_list`, `lockly_guest_added`
 
 ## Entities
 
-Each lock creates two entities:
+Each lock creates four entities:
 
 ### Lock entity
 
@@ -180,12 +181,13 @@ Credentials (email and password) are stored in HA's config entry. The integratio
 
 ## Known Limitations
 
-- **Bluetooth-only locks** (without a PGH hub) are not supported.
-- **Silent polling requires hub firmware build ≥ 422** (for major version 2 hubs). On older firmware, state only updates when commanded through HA or when the integration restarts.
-- **Real-time MQTT push is in progress**: The integration connects to the Lockly MQTT broker at startup using JWT auth. If connection is refused, state updates fall back to the 30-second poll. The exact username format required by the broker has not been verified against a live session; see [Enabling debug logs](#enabling-debug-logs) if MQTT fails to connect.
+- **Locks with no PGH hub are not supported.** This covers both Bluetooth-only locks and WiFi-native models such as the `PGD728FG25`, which connect straight to WiFi. The `senddata` endpoint relays commands through a hub, so with an empty `hubid` the cloud returns `cod=930` for both state and commands. The integration now detects this and says so rather than reporting a bare error code. Supporting these locks needs a different API path (tracked in issue #2).
+- **Unlock is verified from 0.5.0.** Two fields in the command frame were wrong: the `str3` hub flag was sent as `00` instead of `01`, and the credential slot was sent as `1` instead of `0` (the host credential lives in slot 0). Both had to be right at once, which is why this took so long to find. Confirmed against physical hardware — a PGD628FN on firmware 4.03.15 behind a PGH220 hub.
+- **Silent polling requires hub firmware build ≥ 422** (for major-version-2 hubs). On older firmware `lock/cachedstatus/get` returns `cod=900` and state only updates at startup and after HA commands. Note that Lockly does not necessarily offer an upgrade: a PGH220 on `2.2.04.17` (build 417) reports itself up to date, five builds short of the requirement.
+- **Real-time MQTT push does not work yet.** The broker requires **client-certificate authentication**: `MqttSSLSocketFactory` in the app loads a CA, a client certificate and a client private key into a `KeyManagerFactory` over TLSv1.2. Connecting without a client certificate is refused (`rc=5`), or accepted and then denied at subscribe time (SUBACK `0x80`). Until this is implemented, state falls back to polling. See [`docs/api.md`](docs/api.md) §17, which also notes a possible HTTP alternative (`v1/proto/handler`).
 - **Battery percentage is approximate** (binary low/normal flag only).
 - **Guest PIN activation is unverified**: `lockly.add_guest` creates the guest record on the Lockly cloud. Whether the PIN is automatically pushed to the lock hardware is not yet confirmed. If the PIN does not work physically, open an issue.
-- **Lock command** (`lock.lock`) has been implemented but not extensively tested across all Lockly hardware generations. If it does not close your lock, please open an issue with your lock model.
+- **`lock.lock` is implemented but unverified.** It differs from unlock by a single byte, and the app confirms these locks support an explicit lock command (`isSupportNewLock` covers PGD628FN). It is genuinely hard to observe on a lock with `autoLock` set, since the bolt throws itself within seconds either way. Please report whether it works on your model.
 - The Lockly API is undocumented and reverse-engineered. A firmware update by Lockly could break this integration. See [`docs/api.md`](docs/api.md) for the full protocol documentation.
 - The RSA keys embedded in `api.py` are extracted from **Lockly app version 3.2.9**. If Lockly rotates the keys in a later app release, the integration will stop working until updated.
 

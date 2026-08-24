@@ -23,8 +23,11 @@ from .api import (
     api_lock,
     api_login,
     api_query_lock_status,
+    api_query_passwords,
     api_unlock,
+    host_password_from,
 )
+from .capabilities import LockCapabilities, resolve_capabilities
 from .mqtt import LocklyMQTTManager
 from .const import (
     CONF_EMAIL,
@@ -66,8 +69,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unloaded:
         coordinator: LocklyCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
         await coordinator.async_shutdown()
-        for svc in (SERVICE_LIST_GUESTS, SERVICE_ADD_GUEST, SERVICE_DELETE_GUEST):
-            hass.services.async_remove(DOMAIN, svc)
+        # The services are domain-wide, so only tear them down with the last
+        # entry — otherwise unloading one account removes them for the others.
+        if not hass.data[DOMAIN]:
+            for svc in (SERVICE_LIST_GUESTS, SERVICE_ADD_GUEST, SERVICE_DELETE_GUEST):
+                hass.services.async_remove(DOMAIN, svc)
+            hass.data.pop(DOMAIN, None)
     return unloaded
 
 
@@ -95,6 +102,14 @@ class LocklyCoordinator(DataUpdateCoordinator):
         # Access log polling state.
         self._history_cursors: dict[str, int] = {}  # lock_id -> LAST_EVENT_SYNC_TIME ms
         self._history_cancel: list = []
+        # Per-lock frame capabilities, learned from the lock type each lock
+        # reports in its status ACK.  Until then the app's own fallback applies.
+        self._capabilities: dict[str, LockCapabilities] = {}
+        # Last nonce each lock returned; replayed in the next command it receives.
+        self._nonces: dict[str, str] = {}
+        # Host password read from each lock, which is authoritative over the
+        # cloud's "hc" copy.  None means "queried and the lock had no slot 0".
+        self._host_passwords: dict[str, str | None] = {}
 
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
@@ -108,9 +123,61 @@ class LocklyCoordinator(DataUpdateCoordinator):
         self.locks, self.des3_key = await api_get_devices(self._session, self.jwt, self.email)
         if not self.locks:
             raise UpdateFailed("Lockly: no locks found after login")
+        # The MQTT broker authenticates with the JWT, so a rotated token needs a
+        # fresh session or push stops silently.
+        mqtt = getattr(self, "_mqtt_manager", None)
+        if mqtt is not None:
+            await mqtt.async_reconnect()
         self._cache_supported = True
         self._pending_live_init = {lock["ID"] for lock in self.locks}
         _LOGGER.info("Lockly: authenticated, found %d lock(s)", len(self.locks))
+        for lock in self.locks:
+            name = lock.get("na") or lock.get("blename") or lock["ID"]
+            missing = [f for f in ("mc", "hc", "hubid") if not lock.get(f)]
+            if missing:
+                _LOGGER.warning(
+                    "Lockly: lock %s is missing %s — commands will fail without it",
+                    name, ", ".join(missing),
+                )
+            # Model/firmware only; mc, hc and iotsecret are credentials and must
+            # never reach the log.
+            _LOGGER.debug(
+                "Lockly lock %s: model=%s fw=%s hub=%s hubver=%s caps=%s",
+                name, lock.get("mod"), lock.get("fwv"),
+                lock.get("hubid") or "(none)", lock.get("hubver"),
+                self._caps_for(lock),
+            )
+
+    def _caps_for(self, lock: dict) -> LockCapabilities:
+        """Capabilities for a lock, using its reported lock type when known."""
+        lock_id = lock["ID"]
+        if lock_id not in self._capabilities:
+            self._capabilities[lock_id] = resolve_capabilities(lock)
+        return self._capabilities[lock_id]
+
+    def _learn_from_status(self, lock: dict, status: dict) -> None:
+        """Record the lock type and nonce a status response revealed."""
+        lock_id = lock["ID"]
+        lock_type = status.get("lock_type")
+        if lock_type is not None:
+            known = self._capabilities.get(lock_id)
+            if known is None or known.lock_type != lock_type:
+                caps = resolve_capabilities(lock, lock_type=lock_type)
+                self._capabilities[lock_id] = caps
+                _LOGGER.debug(
+                    "Lockly: lock %s reports %s",
+                    lock.get("na") or lock.get("blename") or lock_id, caps,
+                )
+                if caps.needs_firmware_check:
+                    _LOGGER.warning(
+                        "Lockly: lock %s (type %d) selects its command format by "
+                        "firmware version, which is not implemented — falling back "
+                        "to the 0x22 frame. Please report this on GitHub.",
+                        lock.get("blename") or lock_id, caps.lock_type,
+                    )
+        nonce = status.get("ble_nonce")
+        if nonce:
+            self._nonces[lock_id] = nonce
 
     async def _async_update_data(self) -> dict:
         await self._ensure_session()
@@ -144,6 +211,7 @@ class LocklyCoordinator(DataUpdateCoordinator):
                 )
 
             if status:
+                self._learn_from_status(lock, status)
                 result[lock_id] = {**lock, **status}
                 any_ok = True
             elif self.data and lock_id in self.data:
@@ -165,23 +233,94 @@ class LocklyCoordinator(DataUpdateCoordinator):
 
         return result
 
-    async def async_unlock_lock(self, lock_id: str) -> bool:
+    async def _refresh_nonce(self, lock: dict) -> str | None:
+        """Live status query immediately before a command, to sync the nonce.
+
+        The lock replays the nonce from its own last status response, and that
+        value changes as the lock is used (physical entry, BLE reconnect).  A
+        stale nonce gets the command NACKed, so we refresh it rather than
+        trusting whatever we last saw — which may be from hours ago.
+        """
+        lock_id = lock["ID"]
+        status = await api_query_lock_status(
+            self._session, self.jwt, self.email, self.des3_key, lock
+        )
+        if status:
+            self._learn_from_status(lock, status)
+            if self.data and lock_id in self.data:
+                self.async_set_updated_data(
+                    {**self.data, lock_id: {**self.data[lock_id], **status}}
+                )
+        else:
+            _LOGGER.debug(
+                "Lockly: pre-command status query failed for %s — reusing last "
+                "known nonce, which the lock may reject",
+                lock.get("blename") or lock_id,
+            )
+        return self._nonces.get(lock_id)
+
+    async def _resolve_host_password(self, lock: dict, nonce: str | None) -> str | None:
+        """Read the host password from the lock, caching it for the session.
+
+        The cloud's ``hc`` is a copy that the app updates locally whenever the
+        host code changes on the lock, so it can be stale — and a stale password
+        is rejected with BLE error FF ("wrong password").  Asking the lock is
+        what the app itself does; ``hc`` stays as the fallback.
+        """
+        lock_id = lock["ID"]
+        if lock_id in self._host_passwords:
+            return self._host_passwords[lock_id]
+
+        entries = await api_query_passwords(
+            self._session, self.jwt, self.email, self.des3_key, lock,
+            nonce=nonce, caps=self._caps_for(lock),
+        )
+        if entries is None:
+            # Do not cache a failure — a transient hub timeout should be retried.
+            return None
+
+        host_pwd = host_password_from(entries)
+        self._host_passwords[lock_id] = host_pwd
+        cloud_hc = str(lock.get("hc") or "")
+        _LOGGER.warning(
+            "Lockly: lock %s reports %d credential(s), slots %s; host slot 0 "
+            "present=%s, matches cloud hc=%s",
+            lock.get("blename") or lock_id,
+            len(entries),
+            sorted({e.get("pwd_id") for e in entries}),
+            host_pwd is not None,
+            (host_pwd == cloud_hc) if host_pwd is not None else "n/a",
+        )
+        return host_pwd
+
+    async def _send_command(self, lock_id: str, *, unlock: bool) -> bool:
         lock = self._get_lock(lock_id)
         if lock is None:
+            _LOGGER.warning("Lockly: lock_id %s is not in the discovered lock list", lock_id)
             return False
-        ok = await api_unlock(self._session, self.jwt, self.email, self.des3_key, lock)
+        nonce = await self._refresh_nonce(lock)
+        host_pwd = await self._resolve_host_password(lock, nonce)
+        action = api_unlock if unlock else api_lock
+        ok = await action(
+            self._session, self.jwt, self.email, self.des3_key, lock,
+            nonce=nonce, caps=self._caps_for(lock),
+            lock_pwd_override=host_pwd,
+        )
         if ok:
-            self._set_optimistic_lock_state(lock_id, is_locked=False)
+            self._set_optimistic_lock_state(lock_id, is_locked=not unlock)
+        else:
+            _LOGGER.warning(
+                "Lockly: %s failed for %s — see the senddata warning above",
+                "unlock" if unlock else "lock",
+                lock.get("na") or lock.get("blename") or lock_id,
+            )
         return ok
 
+    async def async_unlock_lock(self, lock_id: str) -> bool:
+        return await self._send_command(lock_id, unlock=True)
+
     async def async_lock_lock(self, lock_id: str) -> bool:
-        lock = self._get_lock(lock_id)
-        if lock is None:
-            return False
-        ok = await api_lock(self._session, self.jwt, self.email, self.des3_key, lock)
-        if ok:
-            self._set_optimistic_lock_state(lock_id, is_locked=True)
-        return ok
+        return await self._send_command(lock_id, unlock=False)
 
     def _set_optimistic_lock_state(self, lock_id: str, is_locked: bool) -> None:
         if self.data and lock_id in self.data:
@@ -331,6 +470,31 @@ def _register_services(hass: HomeAssistant, coordinator: LocklyCoordinator) -> N
             "success": ok,
         })
 
+    async def handle_query_passwords(call) -> None:
+        """Diagnostic: read the lock's credential list and report what it holds.
+
+        Reports slot numbers and whether the host slot matches the cloud's copy.
+        The passwords themselves are deliberately not logged or published.
+        """
+        lock_id = call.data["lock_id"]
+        lock = coordinator._get_lock(lock_id)
+        if lock is None:
+            _LOGGER.error("query_passwords: lock_id %s not found", lock_id)
+            return
+        # Forget any cached answer so the service always re-reads the lock.
+        coordinator._host_passwords.pop(lock_id, None)
+        nonce = await coordinator._refresh_nonce(lock)
+        host_pwd = await coordinator._resolve_host_password(lock, nonce)
+        hass.bus.async_fire("lockly_passwords_queried", {
+            "lock_id": lock_id,
+            "lock_name": lock.get("na") or lock.get("blename") or lock_id,
+            "host_slot_found": host_pwd is not None,
+            "matches_cloud_hc": (
+                host_pwd == str(lock.get("hc") or "") if host_pwd is not None else None
+            ),
+        })
+
+    hass.services.async_register(DOMAIN, "query_passwords", handle_query_passwords, schema=_LIST_GUESTS_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_LIST_GUESTS,  handle_list_guests,  schema=_LIST_GUESTS_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_ADD_GUEST,    handle_add_guest,    schema=_ADD_GUEST_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_DELETE_GUEST, handle_delete_guest, schema=_DELETE_GUEST_SCHEMA)

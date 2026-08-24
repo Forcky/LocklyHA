@@ -93,3 +93,19 @@ delete_guest:
         number:
           min: 1
           mode: box
+
+query_passwords:
+  name: Query lock passwords
+  description: >-
+    Diagnostic. Reads the credential list directly from the lock and reports how
+    many slots it holds and whether the host slot matches the copy the cloud
+    reports. The passwords themselves are never logged or published. This wakes
+    the lock, so it will beep.
+  fields:
+    lock_id:
+      name: Lock ID
+      description: The lock's device UUID (the ID field, 24 hex characters).
+      required: true
+      example: "300021003131471535373831"
+      selector:
+        text:

@@ -77,7 +77,7 @@ class LocklyBatterySensor(CoordinatorEntity, SensorEntity):
             identifiers={(DOMAIN, lock_id)},
             name=_lock_display_name(lock, lock_id),
             manufacturer="Lockly",
-            model=lock.get("lockType") or "Smart Lock",
+            model=lock.get("mod") or "Smart Lock",
         )
 
     @property
@@ -130,7 +130,7 @@ class LocklyLastAccessSensor(CoordinatorEntity, SensorEntity):
             identifiers={(DOMAIN, lock_id)},
             name=_lock_display_name(lock, lock_id),
             manufacturer="Lockly",
-            model=lock.get("lockType") or "Smart Lock",
+            model=lock.get("mod") or "Smart Lock",
         )
 
     @property

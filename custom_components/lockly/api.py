@@ -12,6 +12,18 @@ import aiohttp
 from Crypto.Cipher import AES, DES3
 from Crypto.PublicKey import RSA
 
+from .capabilities import (
+    _NO_PASSWORDS_ACK,
+    _STR3_DIRECT,
+    _STR3_HUB,
+    ACTION_LOCK,
+    ACTION_UNLOCK,
+    CMD_QUERY_PASSWORDS,
+    CMD_QUERY_STATUS,
+    DEFAULT_CAPABILITIES,
+    UNLOCK_TYPE_HOST,
+    LockCapabilities,
+)
 from .const import API_BASE, API_USER_AGENT, COMMON_BODY, SENDDATA_TIMEOUT
 
 _LOGGER = logging.getLogger(__name__)
@@ -152,82 +164,267 @@ def build_ble_frame(payload: bytes, type_byte: int) -> bytes:
     return frame_no_crc + bytes([crc8_lockly(frame_no_crc)])
 
 
-def _build_cmd_hex(cmd_code: str, master_code: str, uuid: str, lock_pwd: str = "") -> str:
-    """Build an AES-encrypted BLE command hex string.
+def _assemble_fields(*fields: str) -> str:
+    """Port of HexUtils.m86802c field concatenation.
 
-    Command content (NewUnlockCmd AES path):
-      cmd_code + mc_len + enc_mc + unlock_type("02") + pwd_expanded + pwd_id("0100") + time_hex + isHub("01")
-
-    pwd_expanded = HexUtils.m86803d(lock_pwd): prepend "0" before each char of lock_pwd.
-    For admin remote unlock, lock_pwd is the "hc" field from BackupLockBean (getLockPwd()).
-    Example: "980798" -> "090800070908" (6 bytes).
+    Each non-empty field is appended verbatim, except single-character fields,
+    which are left-padded to two ("2" -> "02").  Empty fields are skipped
+    entirely (TextUtils.isEmpty in the app) — that is how an absent nonce drops
+    out of the frame rather than becoming "00".
     """
-    enc_mc = encrypt_master_code(master_code, uuid)
-    mc_len = f"{len(enc_mc) // 2:02x}"
-    aes_key = derive_aes_key(master_code, uuid)
+    out: list[str] = []
+    for field in fields:
+        if not field:
+            continue
+        out.append("0" + field if len(field) == 1 else field)
+    return "".join(out)
 
-    now = datetime.now()
-    time_str = now.strftime("%y%m%d%H%M%S")
-    time_hex = "".join(f"{int(time_str[i:i+2]):02x}" for i in range(0, 12, 2))
 
-    pwd_expanded = "".join("0" + c for c in str(lock_pwd)) if lock_pwd else ""
-    raw = cmd_code + mc_len + enc_mc + "02" + pwd_expanded + "0100" + time_hex + "01"
-    byte_len = len(raw) // 2
-    remainder = byte_len % 16
+def _aes_wrap(raw_hex: str, aes_key: bytes) -> str:
+    """Zero-pad to a 16-byte boundary, AES-ECB encrypt, wrap in a BLE frame.
+
+    The frame's type byte holds the zero-padding length in its high nibble
+    (AESBean.getZeroPadding) and 5 = AES-128/ECB in its low nibble.
+    """
+    remainder = (len(raw_hex) // 2) % 16
     padding = "" if remainder == 0 else "00" * (16 - remainder)
-    padded = raw + padding
-
-    encrypted = AES.new(aes_key, AES.MODE_ECB).encrypt(bytes.fromhex(padded))
-    pad_byte_count = len(padding) // 2
-    type_byte_val = f"{pad_byte_count:X}5"
-    if len(type_byte_val) % 2:
-        type_byte_val = "0" + type_byte_val
-    type_byte = bytes.fromhex(type_byte_val)[0]
+    encrypted = AES.new(aes_key, AES.MODE_ECB).encrypt(bytes.fromhex(raw_hex + padding))
+    type_byte = ((len(padding) // 2) << 4) | 0x5
     return build_ble_frame(encrypted, type_byte).hex().upper()
+
+
+def _expand_digits(value: str) -> str:
+    """HexUtils.m86803d: prepend "0" to each character ("980798" -> "090800070908")."""
+    return "".join("0" + c for c in str(value)) if value else ""
+
+
+def _timestamp_hex() -> str:
+    """DataUtils.m86660o: current local time as packed yyMMddHHmmss (6 bytes)."""
+    time_str = datetime.now().strftime("%y%m%d%H%M%S")
+    return "".join(f"{int(time_str[i:i+2]):02x}" for i in range(0, 12, 2))
 
 
 def build_query_status_cmd(master_code: str, uuid: str) -> str:
     """Build QueryLockStatus BLE command hex string for senddata 'cmd' field."""
     enc_mc = encrypt_master_code(master_code, uuid)
-    mc_len = f"{len(enc_mc) // 2:02x}"
-    aes_key = derive_aes_key(master_code, uuid)
-
-    now = datetime.now()
-    time_str = now.strftime("%y%m%d%H%M%S")
-    time_hex = "".join(f"{int(time_str[i:i+2]):02x}" for i in range(0, 12, 2))
-
-    # CMD_NEW_QUERY_LOCK_STATUS = "1E"
-    raw = "1E" + mc_len + enc_mc + time_hex + "01"
-    byte_len = len(raw) // 2
-    remainder = byte_len % 16
-    padding = "" if remainder == 0 else "00" * (16 - remainder)
-    padded = raw + padding
-
-    encrypted = AES.new(aes_key, AES.MODE_ECB).encrypt(bytes.fromhex(padded))
-    pad_byte_count = len(padding) // 2
-    type_byte_val = f"{pad_byte_count:X}5"
-    if len(type_byte_val) % 2:
-        type_byte_val = "0" + type_byte_val
-    type_byte = bytes.fromhex(type_byte_val)[0]
-    return build_ble_frame(encrypted, type_byte).hex().upper()
+    raw = _assemble_fields(
+        CMD_QUERY_STATUS,
+        f"{len(enc_mc) // 2:d}",
+        enc_mc,
+        _timestamp_hex(),
+        _STR3_HUB,
+    )
+    return _aes_wrap(raw, derive_aes_key(master_code, uuid))
 
 
-def build_unlock_cmd(master_code: str, uuid: str, lock_pwd: str = "") -> str:
-    """Build NewUnlock BLE command hex (cmd_code "22", unlock type "02").
+def _build_cmd_hex(
+    cmd_code: str,
+    master_code: str,
+    uuid: str,
+    lock_pwd: str = "",
+    *,
+    action: str = ACTION_UNLOCK,
+    nonce: str | None = None,
+    via_hub: bool = True,
+    slot_id: int = 1,
+    unlock_type: str = UNLOCK_TYPE_HOST,
+) -> str:
+    """Build an AES-encrypted lock/unlock BLE command frame.
 
-    lock_pwd must be the "hc" field from BackupLockBean (getLockPwd()) so the
-    lock can verify the command.  Omitting it causes a silent NACK from the lock.
+    Field order is NewUnlockCmd.getData -> HexUtils.m86802c:
+
+        cmd + mc_len + enc_mc + unlock_type + pwd + slot_id + action + str3 + nonce
+
+    - ``lock_pwd`` is the lock's "hc" field (BluetoothBean.getLockPwd()), digit
+      expanded by HexUtils.m86803d.  The lock NACKs a command that omits it.
+    - ``via_hub`` selects str3: getDataForHub passes "1", getDataForBluetooth and
+      getDataForNetwork pass "0".  Every cloud senddata command is relayed by a
+      hub, so this is "01" — sending "00" here is what made unlock fail before.
+    - ``nonce`` is the 8-byte value from the lock's last status ACK
+      (QueryLockStatusCmd stores data[38:54] as ble_aes_random_numbers_1062).
+      When None the field is omitted, matching the app before it has ever seen a
+      status response.
+    - ``slot_id`` is DataUtils.m86645J(pwdId), or getUserId() on 0x52 locks.
     """
-    return _build_cmd_hex("22", master_code, uuid, lock_pwd)
+    enc_mc = encrypt_master_code(master_code, uuid)
+    raw = _assemble_fields(
+        cmd_code,
+        f"{len(enc_mc) // 2:d}",
+        enc_mc,
+        unlock_type,
+        _expand_digits(lock_pwd),
+        f"{slot_id:x}",
+        action,
+        _STR3_HUB if via_hub else _STR3_DIRECT,
+        (nonce or "").upper(),
+    )
+    return _aes_wrap(raw, derive_aes_key(master_code, uuid))
 
 
-def build_lock_cmd(master_code: str, uuid: str, lock_pwd: str = "") -> str:
-    """Build NewLock BLE command hex (same frame as unlock; directive "lock" signals intent).
+def build_unlock_cmd(
+    master_code: str,
+    uuid: str,
+    lock_pwd: str = "",
+    nonce: str | None = None,
+    *,
+    caps: LockCapabilities | None = None,
+) -> str:
+    """Build a NewUnlock BLE command frame for a hub-relayed unlock.
 
-    NewLockCmd reuses NewUnlockCmd's frame per APK analysis (NewLockCmd.execute calls
-    newUnlockCmd.getDataForHub).  lock_pwd must be the "hc" field (getLockPwd()).
+    lock_pwd must be the "hc" field from BackupLockBean (getLockPwd()); omitting
+    it causes a silent NACK from the lock.
     """
-    return _build_cmd_hex("22", master_code, uuid, lock_pwd)
+    return _build_cmd_hex(
+        (caps or DEFAULT_CAPABILITIES).cmd_code,
+        master_code,
+        uuid,
+        lock_pwd,
+        action=ACTION_UNLOCK,
+        nonce=nonce,
+        slot_id=(caps or DEFAULT_CAPABILITIES).slot_id,
+    )
+
+
+def build_lock_cmd(
+    master_code: str,
+    uuid: str,
+    lock_pwd: str = "",
+    nonce: str | None = None,
+    *,
+    caps: LockCapabilities | None = None,
+) -> str:
+    """Build a NewLock BLE command frame.
+
+    NewLockCmd reuses NewUnlockCmd's builder (NewLockCmd.execute calls
+    newUnlockCmd.getDataForHub); only the action field and the API directive
+    differ from unlock.
+    """
+    return _build_cmd_hex(
+        (caps or DEFAULT_CAPABILITIES).cmd_code,
+        master_code,
+        uuid,
+        lock_pwd,
+        action=ACTION_LOCK,
+        nonce=nonce,
+        slot_id=(caps or DEFAULT_CAPABILITIES).slot_id,
+    )
+
+
+def build_query_pwd_cmd(
+    master_code: str,
+    uuid: str,
+    position: int = 0,
+    nonce: str | None = None,
+) -> str:
+    """Build a QueryPwd147 (0x93) frame — reads the lock's credential list.
+
+    QueryPwd147Cmd.getData assembles: cmd + mc_len + enc_mc + position + nonce.
+    It always uses the stored nonce, not the timestamp branch.
+
+    On a lock that is not shared via tenant access, getTenantAccessAESKey /
+    getTenantAccessEncryptMasterCode / getTenantAccessEncryptType all fall back
+    to the ordinary host derivations, so this reuses the same key and enc_mc as
+    every other command.
+
+    The response is paginated; ``position`` is the page index.
+    """
+    enc_mc = encrypt_master_code(master_code, uuid)
+    raw = _assemble_fields(
+        CMD_QUERY_PASSWORDS,
+        f"{len(enc_mc) // 2:d}",
+        enc_mc,
+        f"{position:x}",
+        (nonce or "").upper(),
+    )
+    return _aes_wrap(raw, derive_aes_key(master_code, uuid))
+
+
+def _decode_pwd_digits(hex_str: str) -> str:
+    """Reverse HexUtils.m86803d — Cmd.getEvenString keeps every second character.
+
+    "090800070908" -> "980798"
+    """
+    return hex_str[1::2]
+
+
+def parse_pwd_list_ack(
+    ack_hex: str,
+    master_code: str,
+    uuid: str,
+    five_hundred_group: bool = False,
+) -> dict[str, Any] | None:
+    """Parse a QueryPwd147 (0x93) response into credential entries.
+
+    Decrypted layout (QueryPwd147Cmd.parseCmd):
+
+        [0:2]  status — "00" is success
+        [2:4]  total pages
+        [4:6]  current page
+        [6:8]  total credentials
+        [8:10] credentials in this page
+        [10:]  entries, parsed by QueryPwdCmd.parseData
+
+    Each entry (QueryPwdCmd.parseData):
+
+        user_type(1B) | pwd_size(1B) | password(pwd_size B) | pwd_id(1B)
+
+    followed by a 20-character schedule block, except when pwd_id is 0 — the
+    host credential carries no schedule.  ``pwd_id == 0`` is the host password:
+    QueryPwdUtil picks exactly that entry as the lock password.
+    """
+    h = ack_hex.upper()
+    if h.lower() == _NO_PASSWORDS_ACK:
+        return {"status_ok": True, "entries": [], "is_end": True, "total": 0}
+    try:
+        payload = bytes.fromhex(h[16:-2])
+        if len(payload) == 0 or len(payload) % 16 != 0:
+            code = h[16:18]
+            _LOGGER.debug(
+                "query passwords rejected: %s — %s", code, describe_ble_error(code)
+            )
+            return None
+        d = AES.new(derive_aes_key(master_code, uuid), AES.MODE_ECB).decrypt(payload).hex()
+        if len(d) < 10 or d[0:2] != "00":
+            _LOGGER.debug("query passwords: status %s", d[0:2] if d else "(empty)")
+            return None
+
+        total_pages = int(d[2:4], 16)
+        cur_page = int(d[4:6], 16)
+        result: dict[str, Any] = {
+            "status_ok": True,
+            "total_pages": total_pages,
+            "cur_page": cur_page,
+            "total": int(d[6:8], 16),
+            "page_count": int(d[8:10], 16),
+            "is_end": cur_page >= total_pages,
+            "entries": [],
+        }
+
+        rest = d[10:]
+        # parseData loops while at least 20 characters remain, but the block is
+        # zero-padded to the AES boundary and 10+ bytes of padding would parse as
+        # a bogus slot-0 entry.  The page's own credential count bounds it.
+        page_count = result["page_count"]
+        while len(rest) >= 20 and len(result["entries"]) < page_count:
+            user_type = int(rest[0:2], 16)
+            pwd_size = int(rest[2:4], 16)
+            pwd_end = 4 + pwd_size * 2
+            password = _decode_pwd_digits(rest[4:pwd_end])
+            if five_hundred_group:
+                id_end = pwd_end + 4
+                pwd_id = int(rest[pwd_end:id_end], 16)
+            else:
+                id_end = pwd_end + 2
+                pwd_id = int(rest[pwd_end:id_end], 16)
+            result["entries"].append(
+                {"user_type": user_type, "pwd_id": pwd_id, "password": password}
+            )
+            # Only non-host entries carry the trailing schedule block.
+            rest = rest[id_end:] if pwd_id == 0 else rest[id_end + 20:]
+        return result
+    except Exception:
+        _LOGGER.exception("Failed to parse password list ACK: %s", ack_hex[:60])
+        return None
 
 
 def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
@@ -246,8 +443,10 @@ def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
             # Short/misaligned payload means the lock sent an error/nack frame.
             _LOGGER.debug("ACK payload not AES-aligned (%d bytes) — lock returned error/nack", len(payload))
             return {}
-        decrypted = AES.new(aes_key, AES.MODE_ECB).decrypt(payload)
-        d = decrypted.rstrip(b"\x00").hex()
+        # Keep the full decrypted hex: trailing 0x00 bytes are meaningful padding
+        # for the fixed field offsets below, and stripping them truncates the
+        # lock type and nonce fields near the end of the block.
+        d = AES.new(aes_key, AES.MODE_ECB).decrypt(payload).hex()
 
         if len(d) < 10:
             _LOGGER.warning("Decrypted ACK too short: %s", d)
@@ -267,6 +466,16 @@ def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
             result["start_voltage"] = int(d[14:16], 16) + int(d[16:18], 16) * 256
         if len(d) >= 36:
             result["auto_unlock_delay_s"] = int(d[32:34], 16) + int(d[34:36], 16) * 256
+        if len(d) >= 38:
+            # QueryLockStatusCmd: lockType = m86670y(data[36:38]) — a plain byte.
+            # Selects the command format for subsequent lock/unlock frames.
+            result["lock_type"] = int(d[36:38], 16)
+        if len(d) >= 54:
+            # QueryLockStatusCmd stores data[38:54] as ble_aes_random_numbers_1062,
+            # keyed by lock uuid, and replays it as the nonce in the next command.
+            result["ble_nonce"] = d[38:54].upper()
+        if len(d) >= 62:
+            result["ble_module_version"] = d[54:62]
         return result
     except Exception:
         _LOGGER.exception("Failed to parse ACK: %s", ack_hex[:60])
@@ -298,10 +507,35 @@ def parse_cached_status(sts: int) -> dict[str, Any]:
         "door_sensor_open": door_open,
         "wired_door_sensor_connected": wired,
         "rf_door_sensor_connected": rf,
+        "secure_lock_mode": bool(sts & 64),
     }
 
 
-# ── HTTP helpers ──────────────────────────────────────────────────────────────
+# ── Error codes ───────────────────────────────────────────────────────────────
+
+_COD_MEANINGS = {
+    "200": "OK",
+    "900": "hub system error, or hub firmware predates this endpoint",
+    "901": "lock not found for this account",
+    "909": "request could not be parsed (para not DES3-encrypted?)",
+    "910": "para not encrypted",
+    "920": "endpoint rejected the request",
+    "930": "hub/Secure LINK not associated with this lock — check the lock is "
+           "bound to a hub in the Lockly app; WiFi-native locks with no hub "
+           "cannot use this endpoint",
+    "931": "Secure LINK already bound to another account",
+    "932": "Secure LINK does not exist",
+    "938": "ID format error",
+    "942": "hub timed out relaying to the lock (out of BLE range?) — transient",
+    "943": "hub offline",
+    "990": "general server error",
+}
+
+
+def describe_cod(cod: str) -> str:
+    """Human-readable meaning for a Lockly API response code."""
+    return _COD_MEANINGS.get(str(cod), "unknown code")
+
 
 def sha256_hex(password: str) -> str:
     """SHA256Util.m87491b: SHA-256 of password string → lowercase hex."""
@@ -414,8 +648,15 @@ async def api_cached_status(
             headers=_headers(jwt),
         ) as resp:
             body = await resp.json(content_type=None)
-            if str(body.get("cod")) != "200":
-                _LOGGER.debug("cachedstatus failed: cod=%s lock=%s", body.get("cod"), lock_id)
+            cod = str(body.get("cod"))
+            if cod != "200":
+                # Logged at the same level as the senddata failure below: when
+                # this is silent, user reports quote only the senddata line and
+                # understate how much is actually failing.
+                _LOGGER.warning(
+                    "cachedstatus failed: cod=%s lock=%s hubid=%s (%s)",
+                    cod, lock_id, lock.get("hubid") or "(empty)", describe_cod(cod),
+                )
                 return None
             data = body.get("data") or {}
             sts = data.get("sts")
@@ -456,9 +697,12 @@ async def api_query_lock_status(
             timeout=aiohttp.ClientTimeout(total=SENDDATA_TIMEOUT),
         ) as resp:
             body = await resp.json(content_type=None)
-            if str(body.get("cod")) != "200" or "ACK" not in body:
+            cod = str(body.get("cod"))
+            if cod != "200" or "ACK" not in body:
                 _LOGGER.warning(
-                    "senddata failed: cod=%s lock=%s", body.get("cod"), lock.get("blename")
+                    "senddata status query failed: cod=%s lock=%s hubid=%s (%s)",
+                    cod, lock.get("blename"), lock.get("hubid") or "(empty)",
+                    describe_cod(cod),
                 )
                 return None
             parsed = parse_ack(body["ACK"], mc, uuid)
@@ -470,6 +714,137 @@ async def api_query_lock_status(
         return None
 
 
+# Lock-side error codes, from Cmd.getErrorInfo() and res/values/strings.xml.
+# These appear as a single unencrypted byte at ack_hex[16:18] when the lock
+# rejects a command.
+_BLE_ERRORS = {
+    "F0": "too many 4-digit access codes (max 10; use 5-8 digits)",
+    "F1": "battery too low for an OTA update",
+    "F5": "Bluetooth connection problem — try again later",
+    "F8": "cannot change the password",
+    "F9": "this credential's valid time period has not started yet",
+    "FA": "lock reported a system error",
+    "FB": "a maximum has been reached",
+    "FD": "this door code has been used before",
+    "FF": "wrong password — the lock rejected the credential in the command",
+}
+
+
+def describe_ble_error(code: str) -> str:
+    """Human-readable meaning for a lock-side BLE error byte."""
+    return _BLE_ERRORS.get(str(code).upper(), "unknown lock error")
+
+
+async def api_query_passwords(
+    session: aiohttp.ClientSession,
+    jwt: str,
+    email: str,
+    des3_key: bytes,
+    lock: dict,
+    nonce: str | None = None,
+    caps: LockCapabilities | None = None,
+    max_pages: int = 16,
+) -> list[dict] | None:
+    """Read the lock's credential list via QueryPwd147 (0x93).
+
+    The cloud's ``hc`` field is only a copy of the host password, and the app
+    updates its own copy locally whenever the host code is changed on the lock
+    (BindLockManager after SetHostPwdCmd).  So ``hc`` can fall behind the lock.
+    This asks the lock directly, the way the app does.
+
+    Returns the credential entries, or None if the query failed.  The host
+    password is the entry whose ``pwd_id`` is 0.
+    """
+    mc = str(lock["mc"])
+    uuid = lock["ID"]
+    five_hundred = bool((caps or DEFAULT_CAPABILITIES).supports_500_group_password)
+
+    entries: list[dict] = []
+    position = 0
+    for _ in range(max_pages):
+        cmd_hex = build_query_pwd_cmd(mc, uuid, position=position, nonce=nonce)
+        req = {
+            "acct": email,
+            "hubid": lock.get("hubid", ""),
+            "dv": uuid,
+            "cmd": cmd_hex,
+            "mdna": lock.get("iotdm", ""),
+        }
+        para = des3_encrypt(des3_key, json.dumps(req, separators=(",", ":")))
+        try:
+            async with session.post(
+                API_BASE + "senddata",
+                json={**COMMON_BODY, "para": para},
+                headers=_headers(jwt),
+                timeout=aiohttp.ClientTimeout(total=SENDDATA_TIMEOUT),
+            ) as resp:
+                body = await resp.json(content_type=None)
+                cod = str(body.get("cod"))
+                if cod != "200" or "ACK" not in body:
+                    _LOGGER.warning(
+                        "query passwords failed: cod=%s lock=%s page=%d (%s)",
+                        cod, lock.get("blename"), position, describe_cod(cod),
+                    )
+                    return None
+                page = parse_pwd_list_ack(body["ACK"], mc, uuid, five_hundred)
+                if page is None:
+                    return None
+        except Exception:
+            _LOGGER.exception(
+                "query passwords request failed for lock %s", lock.get("blename")
+            )
+            return None
+
+        entries.extend(page.get("entries") or [])
+        if page.get("is_end", True):
+            break
+        position = int(page.get("cur_page", position)) + 1
+
+    return entries
+
+
+def host_password_from(entries: list[dict]) -> str | None:
+    """Pick the host credential out of a queried list.
+
+    QueryPwdUtil.m87342t returns the entry whose pwd_id is 0.
+    """
+    for entry in entries or []:
+        if entry.get("pwd_id") == 0:
+            return entry.get("password") or None
+    return None
+
+
+def _ack_reports_success(ack_hex: str, master_code: str, uuid: str) -> tuple[bool, str]:
+    """Decide whether a lock/unlock ACK means the lock actually acted.
+
+    ``cod=200`` only means the cloud accepted the request and the hub relayed it.
+    The lock's own verdict is in the ACK frame, so a NACK must not be reported to
+    Home Assistant as a successful unlock.
+
+    A rejection comes back as a short, unencrypted frame whose cmd-type byte is
+    ``0C`` rather than ``0A``, followed by one error byte (``Cmd.getErrorCode``
+    reads exactly this offset). A success carries an AES-encrypted status block.
+
+    Returns (accepted, detail).
+    """
+    if not ack_hex:
+        return False, "no ACK returned"
+    h = ack_hex.upper()
+    try:
+        payload = bytes.fromhex(h[16:-2])
+        if len(payload) == 0:
+            return False, "lock returned an empty ACK"
+        if len(payload) % 16 != 0:
+            # Short frame = rejection; the first payload byte is the error code.
+            code = h[16:18]
+            return False, f"lock rejected the command: {code} — {describe_ble_error(code)}"
+        d = AES.new(derive_aes_key(master_code, uuid), AES.MODE_ECB).decrypt(payload).hex()
+        status = int(d[8:10], 16) if len(d) >= 10 else None
+        return True, f"lock ACK status=0x{status:02X}" if status is not None else "lock ACK"
+    except Exception:
+        return False, f"unparseable ACK {ack_hex[:24]}"
+
+
 async def _api_send_directive(
     session: aiohttp.ClientSession,
     jwt: str,
@@ -479,10 +854,24 @@ async def _api_send_directive(
     directive: str,
     cmd_hex: str,
 ) -> bool:
-    """Send lock/unlock directive via senddata. Returns True if cod=200."""
+    """Send a lock/unlock directive via senddata.
+
+    Returns True only when the cloud accepted the request *and* the lock's ACK
+    frame parses as an acknowledgement.
+    """
+    hub_id = str(lock.get("hubid") or "")
+    if not hub_id:
+        _LOGGER.error(
+            "Lock %s has no hub (hubid is empty) — the senddata endpoint relays "
+            "commands through a Lockly hub and cannot control this lock. "
+            "WiFi-native locks are not yet supported; see issue #2.",
+            lock.get("blename") or lock.get("ID"),
+        )
+        return False
+
     req = {
         "acct": email,
-        "hubid": lock.get("hubid", ""),
+        "hubid": hub_id,
         "dv": lock["ID"],
         "cmd": cmd_hex,
         "mdna": lock.get("iotdm", ""),
@@ -501,9 +890,21 @@ async def _api_send_directive(
             ack = body.get("ACK", "")
             _LOGGER.debug(
                 "senddata directive=%s cod=%s ack=%s lock=%s",
-                directive, cod, ack[:20] if ack else "(none)", lock.get("blename"),
+                directive, cod, ack or "(none)", lock.get("blename"),
             )
-            return cod == "200"
+            if cod != "200":
+                _LOGGER.warning(
+                    "senddata %s failed: cod=%s lock=%s (%s)",
+                    directive, cod, lock.get("blename") or lock["ID"], describe_cod(cod),
+                )
+                return False
+            accepted, detail = _ack_reports_success(ack, str(lock["mc"]), lock["ID"])
+            if not accepted:
+                _LOGGER.warning(
+                    "senddata %s: cloud accepted (cod=200) but lock %s did not — %s",
+                    directive, lock.get("blename") or lock["ID"], detail,
+                )
+            return accepted
     except Exception:
         _LOGGER.exception(
             "senddata directive=%s failed for lock %s", directive, lock.get("blename")
@@ -517,13 +918,16 @@ async def api_unlock(
     email: str,
     des3_key: bytes,
     lock: dict,
+    nonce: str | None = None,
+    caps: LockCapabilities | None = None,
+    lock_pwd_override: str | None = None,
 ) -> bool:
-    """Send unlock command. Returns True if server acknowledged."""
+    """Send unlock command. Returns True if the lock acknowledged."""
     mc = str(lock["mc"])
-    lock_pwd = str(lock.get("hc") or "")
+    lock_pwd = lock_pwd_override if lock_pwd_override is not None else str(lock.get("hc") or "")
     return await _api_send_directive(
         session, jwt, email, des3_key, lock, "unlock",
-        build_unlock_cmd(mc, lock["ID"], lock_pwd),
+        build_unlock_cmd(mc, lock["ID"], lock_pwd, nonce, caps=caps),
     )
 
 
@@ -533,13 +937,16 @@ async def api_lock(
     email: str,
     des3_key: bytes,
     lock: dict,
+    nonce: str | None = None,
+    caps: LockCapabilities | None = None,
+    lock_pwd_override: str | None = None,
 ) -> bool:
-    """Send lock command. Returns True if server acknowledged."""
+    """Send lock command. Returns True if the lock acknowledged."""
     mc = str(lock["mc"])
-    lock_pwd = str(lock.get("hc") or "")
+    lock_pwd = lock_pwd_override if lock_pwd_override is not None else str(lock.get("hc") or "")
     return await _api_send_directive(
         session, jwt, email, des3_key, lock, "lock",
-        build_lock_cmd(mc, lock["ID"], lock_pwd),
+        build_lock_cmd(mc, lock["ID"], lock_pwd, nonce, caps=caps),
     )
 
 
