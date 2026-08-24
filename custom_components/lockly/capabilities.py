@@ -166,12 +166,18 @@ class LockCapabilities:
 
     @property
     def slot_id(self) -> int:
-        """Credential slot in the frame — DataUtils.m86645J(pwdId), or getUserId() on 0x52.
+        """Credential slot in the frame — DataUtils.m86645J(pwdId).
 
-        The app sets pwdId to 0 for host unlocks on locks that support access
-        users, and 1 otherwise; 1 is the value verified against 0x22 hardware.
+        LockerManager sets pwdId to "0" when it builds the bean for a host that
+        is not a sub-admin, and NewUnlockCmd's 0x52 branch does the same
+        explicitly for hosts.  ``getPwdId()``'s "1" is only the fallback for a
+        bean where pwdId was never assigned — so a host command carries slot 0,
+        which is where the host credential actually lives.
+
+        Sending slot 1 with the host password makes the lock compare that
+        password against a different credential and reject it with BLE error FF.
         """
-        return 1
+        return 0 if self.is_host else 1
 
     @property
     def needs_firmware_check(self) -> bool:

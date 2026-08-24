@@ -76,7 +76,7 @@ def test_unlock_plaintext() -> None:
         + enc_mc                # master code XOR uuid
         + "02"                  # getUnLockType() = host
         + "090800070908"        # HexUtils.m86803d("980798") — the hc lock password
-        + "01"                  # DataUtils.m86645J(pwdId=1)
+        + "00"                  # DataUtils.m86645J(pwdId=0) — host slot
         + "01"                  # str2 = unlock
         + "01"                  # str3 = 1, hub-relayed  <-- the field that was wrong
         + NONCE                 # stored nonce from the last status ACK
@@ -88,6 +88,7 @@ def test_unlock_plaintext() -> None:
     # Field offsets in hex characters: cmd 0, mc_len 2, enc_mc 4, unlock_type 20,
     # hc 22, slot 34, action 36, str3 38, nonce 40.
     check("str3 is hub (01), not direct (00)", plaintext[_STR3], "01")
+    check("slot field is host slot 0", plaintext[34:36], "00")
     check("nonce at expected offset", plaintext[40:56], NONCE)
 
 
