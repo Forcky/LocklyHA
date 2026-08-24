@@ -139,18 +139,41 @@ class LocklyLastAccessSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def native_value(self) -> str | None:
+        """Who last opened the lock.
+
+        The coordinator resolves the credential slot to a name where it can.
+        When it cannot, report the slot rather than "Unknown" — a slot number is
+        at least actionable, and the old behaviour reported every keypad and
+        fingerprint entry as Unknown because those carry no name in the event.
+        """
         event = self._lock_data.get("last_access_event")
-        if event is None:
+        if not event:
             return None
-        return event.get("na") or "Unknown"
+        operator = event.get("operator")
+        if operator:
+            return operator
+        pid = event.get("pid")
+        if pid is None:
+            return "Unknown"
+        if event.get("operator_candidates"):
+            return f"Slot {pid} (ambiguous)"
+        return f"Slot {pid}"
 
     @property
     def extra_state_attributes(self) -> dict:
         event = self._lock_data.get("last_access_event")
         if not event:
             return {}
-        return {
-            "event_type": event.get("co") or "UNKNOWN",
+        attrs: dict = {
+            # Raw numeric code from the lock; the label mapping is not yet ported.
+            "event_code": event.get("co"),
+            "credential_slot": event.get("pid"),
             "timestamp": event.get("tm"),
             "event_id": event.get("id"),
         }
+        candidates = event.get("operator_candidates")
+        if candidates:
+            # Slot numbers are namespaced per credential type, so a slot can map
+            # to more than one user and the event does not say which type it was.
+            attrs["operator_candidates"] = candidates
+        return attrs

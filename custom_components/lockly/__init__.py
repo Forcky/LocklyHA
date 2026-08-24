@@ -34,6 +34,7 @@ from .const import (
     CONF_PASSWORD,
     DOMAIN,
     HISTORY_INTERVAL_SECONDS,
+    HISTORY_LOOKBACK_DAYS,
     SCAN_INTERVAL_SECONDS,
     SERVICE_ADD_GUEST,
     SERVICE_DELETE_GUEST,
@@ -339,13 +340,59 @@ class LocklyCoordinator(DataUpdateCoordinator):
         )
         self._history_cancel.append(cancel)
 
+    @staticmethod
+    def _resolve_operator(lock: dict, event: dict) -> tuple[str | None, list[str]]:
+        """Best-effort name for whoever triggered an access event.
+
+        ``na`` is only filled in for app-initiated actions.  A keypad or
+        fingerprint entry is anonymous there, and the only identifying field is
+        ``pid``, the credential slot.  The lock's ``usrarr`` maps slots to names,
+        but slot numbers are namespaced per credential type — a fingerprint and a
+        passcode can both be pid 1 — and the event does not record which type it
+        was.  So resolve only when exactly one user matches, and report the
+        candidates rather than picking one arbitrarily.
+
+        Returns (name, ambiguous_candidates).
+        """
+        stated = str(event.get("na") or "").strip()
+        if stated:
+            return stated, []
+        pid = event.get("pid")
+        if pid is None:
+            return None, []
+        names = set()
+        for user in lock.get("usrarr") or []:
+            if user.get("pid") != pid:
+                continue
+            name = f"{user.get('fn') or ''} {user.get('ln') or ''}".strip()
+            if name:
+                names.add(name)
+        candidates = sorted(names)
+        if len(candidates) == 1:
+            return candidates[0], []
+        return None, candidates
+
+    def _history_start_cursor(self) -> int:
+        """Where to begin reading the access log on first sync.
+
+        Seeded to a recent timestamp rather than 0: getlkhist walks forward from
+        the cursor oldest-first, so starting at 0 replays the lock's entire
+        history one page per poll.  On a lock with years of records that means
+        "last access" shows an event from years ago and never catches up.
+        """
+        lookback = timedelta(days=HISTORY_LOOKBACK_DAYS)
+        return int((datetime.now(timezone.utc) - lookback).timestamp() * 1000)
+
     async def _async_poll_history(self, _now=None) -> None:
         if not self.jwt or self.des3_key is None or not self.locks:
             return
         await self._ensure_session()
         for lock in self.locks:
             lock_id = lock["ID"]
-            since_ms = self._history_cursors.get(lock_id, 0)
+            since_ms = self._history_cursors.get(lock_id)
+            if since_ms is None:
+                since_ms = self._history_start_cursor()
+                self._history_cursors[lock_id] = since_ms
             result = await api_get_lock_history(
                 self._session, self.jwt, self.des3_key, self.email, lock_id, since_ms
             )
@@ -356,14 +403,20 @@ class LocklyCoordinator(DataUpdateCoordinator):
                 self._history_cursors[lock_id] = new_cursor
             for event in events:
                 _LOGGER.debug("lockly history event raw: %s", event)
+                operator, candidates = self._resolve_operator(lock, event)
+                # Resolution is attached to the event so the sensor and the bus
+                # event agree, and so it is computed once per event.
+                event["operator"] = operator
+                event["operator_candidates"] = candidates
                 self.hass.bus.async_fire(
                     "lockly_lock_event",
                     {
                         "lock_id": lock_id,
                         "lock_name": lock.get("na") or lock.get("blename") or lock_id,
                         "event_type": event.get("co") or "UNKNOWN",
-                        "user_id": str(event.get("pid") or ""),
-                        "user_name": event.get("na") or "",
+                        "user_id": str(event.get("pid") if event.get("pid") is not None else ""),
+                        "user_name": operator or "",
+                        "operator_candidates": candidates,
                         "timestamp": event.get("tm") or 0,
                         "event_id": event.get("id") or 0,
                     },
