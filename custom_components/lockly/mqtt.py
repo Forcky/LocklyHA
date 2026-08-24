@@ -16,6 +16,9 @@ _BROKER = "mqttuswest02-lb-001-b5ed8c5e37b3a497.elb.us-west-2.amazonaws.com"
 _PORT = 8883
 _TOPIC = "server"
 
+# Give up after this many non-permanent refusals rather than reconnecting forever.
+_MAX_REFUSALS = 3
+
 # Client-certificate material for the broker, taken from res/raw of the Lockly
 # app (3.2.9): R.raw.ca, R.raw.client and R.raw.client_key, the three files
 # MqttSSLSocketFactory loads.  They are shipped in every copy of the app, so
@@ -39,11 +42,29 @@ class LocklyMQTTManager:
         self._coordinator = coordinator
         self._client: paho.Client | None = None
         self._connected = False
+        self._refusals = 0
+        self._gave_up = False
 
     @property
     def connected(self) -> bool:
         """True once the broker has accepted the connection."""
         return self._connected
+
+    def _give_up(self) -> None:
+        """Stop paho's reconnect loop after an unrecoverable refusal.
+
+        Called from a paho callback thread, so this must not touch the event
+        loop — loop_stop() and disconnect() are both safe from there.
+        """
+        self._gave_up = True
+        client = self._client
+        if client is None:
+            return
+        try:
+            client.loop_stop()
+            client.disconnect()
+        except Exception:  # noqa: BLE001 - teardown must not raise
+            _LOGGER.debug("Lockly MQTT: error while stopping the client", exc_info=True)
 
     async def async_start(self) -> None:
         jwt = self._coordinator.jwt
@@ -70,11 +91,21 @@ class LocklyMQTTManager:
                 client.subscribe(_TOPIC, qos=0)
             else:
                 self._connected = False
+                # rc=5 is "not authorised": a credential problem, not a
+                # transient one.  paho's network loop reconnects on its own, so
+                # without stopping it here this becomes a connect-refuse-retry
+                # storm against Lockly's broker several times a second, which
+                # risks the account being throttled.
+                self._refusals += 1
+                permanent = rc == 5
                 _LOGGER.warning(
-                    "Lockly MQTT connection refused rc=%s — "
-                    "real-time push disabled, polling continues",
+                    "Lockly MQTT connection refused rc=%s%s — real-time push "
+                    "disabled, polling continues",
                     rc,
+                    " (not authorised; not retrying)" if permanent else "",
                 )
+                if permanent or self._refusals >= _MAX_REFUSALS:
+                    self._give_up()
 
         def on_disconnect(client, userdata, rc):
             self._connected = False
@@ -93,6 +124,10 @@ class LocklyMQTTManager:
                     "arrive; state falls back to polling",
                     _TOPIC,
                 )
+                # Holding the session open achieves nothing once the only topic
+                # we want has been refused, so drop it rather than keeping a
+                # pointless connection alive.
+                self._give_up()
             else:
                 _LOGGER.info(
                     "Lockly MQTT subscribed to %r at qos=%s", _TOPIC, codes
@@ -128,7 +163,14 @@ class LocklyMQTTManager:
             except (AttributeError, TypeError):
                 cli = paho.Client(client_id=client_id, protocol=paho.MQTTv311)  # paho 1.x
 
-            cli.username_pw_set(email, jwt)
+            # MqttConnectionOption.getUserName() returns
+            # "{user_client_id}_{email}" when a server-assigned client id is
+            # known, falling back to the bare email otherwise.  The broker
+            # authorises subscriptions by that identity, so without the client
+            # id it accepts the connection and then refuses the topic.
+            server_client_id = getattr(self._coordinator, "mqtt_client_id", None)
+            username = f"{server_client_id}_{email}" if server_client_id else email
+            cli.username_pw_set(username, jwt)
             cli.on_connect = on_connect
             cli.on_disconnect = on_disconnect
             cli.on_subscribe = on_subscribe
@@ -158,8 +200,17 @@ class LocklyMQTTManager:
                 )
             )
             await self._hass.async_add_executor_job(cli.tls_insecure_set, True)
+            # getHeartbeatTime returns the authoritative broker address; the
+            # hardcoded PgConfig value is only the fallback.
+            host = getattr(self._coordinator, "mqtt_host", None) or _BROKER
+            port = getattr(self._coordinator, "mqtt_port", None) or _PORT
+            _LOGGER.debug(
+                "Lockly MQTT connecting to %s:%s as %s (client id %s)",
+                host, port, username,
+                "from API" if server_client_id else "generated",
+            )
             await self._hass.async_add_executor_job(
-                lambda: cli.connect(_BROKER, _PORT, keepalive=60)
+                lambda: cli.connect(host, int(port), keepalive=60)
             )
             await self._hass.async_add_executor_job(cli.loop_start)
         except Exception:

@@ -16,6 +16,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import (
     api_cached_status,
     api_get_devices,
+    api_get_heartbeat,
     api_get_lock_history,
     api_add_guest,
     api_delete_guest,
@@ -111,6 +112,12 @@ class LocklyCoordinator(DataUpdateCoordinator):
         # Host password read from each lock, which is authoritative over the
         # cloud's "hc" copy.  None means "queried and the lock had no slot 0".
         self._host_passwords: dict[str, str | None] = {}
+        # MQTT push configuration from getHeartbeatTime.  The broker authorises
+        # subscriptions by client identity, and client_id is the only one the
+        # API exposes; None means we never got it and fall back to defaults.
+        self.mqtt_client_id: str | None = None
+        self.mqtt_host: str | None = None
+        self.mqtt_port: int | None = None
 
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
@@ -124,6 +131,23 @@ class LocklyCoordinator(DataUpdateCoordinator):
         self.locks, self.des3_key = await api_get_devices(self._session, self.jwt, self.email)
         if not self.locks:
             raise UpdateFailed("Lockly: no locks found after login")
+        # The broker authorises subscriptions by client identity, so fetch the
+        # push config before (re)connecting.  Uses the config entry id as a
+        # stable per-install device id, standing in for the app's own.
+        heartbeat = await api_get_heartbeat(
+            self._session, self.jwt, self.des3_key, self.config_entry.entry_id
+        )
+        if heartbeat:
+            self.mqtt_client_id = heartbeat.get("client_id")
+            self.mqtt_host = heartbeat.get("host")
+            self.mqtt_port = heartbeat.get("port")
+            _LOGGER.info(
+                "Lockly: MQTT config from getHeartbeatTime — client_id=%s host=%s port=%s",
+                "present" if self.mqtt_client_id else "absent",
+                self.mqtt_host or "(default)",
+                self.mqtt_port or "(default)",
+            )
+
         # The MQTT broker authenticates with the JWT, so a rotated token needs a
         # fresh session or push stops silently.
         mqtt = getattr(self, "_mqtt_manager", None)
