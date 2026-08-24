@@ -31,6 +31,8 @@ This document describes the Lockly cloud API as reverse-engineered from the Lock
 21. [Error Codes](#21-error-codes)
 22. [CRC-8 Algorithm](#22-crc-8-algorithm)
 23. [Reverse Engineering Notes](#23-reverse-engineering-notes)
+24. [Credential List — QueryPwd147 (0x93)](#24-credential-list--querypwd147-0x93)
+25. [Lock-side BLE Error Codes](#25-lock-side-ble-error-codes)
 
 ---
 
@@ -488,7 +490,7 @@ to `HexUtils.m86802c`, which concatenates them with two rules that matter:
 | `enc_mc` | `getEncryptMasterCode()` | 8 bytes, mc XOR uuid |
 | `unlock_type` | `getUnLockType()` | `02` = host/admin, `03` = long-term or staff |
 | `pwd` | `HexUtils.m86803d(getLockPwd())` | the lock's `hc`, digit-expanded — `"980798"` → `090800070908` |
-| `pwd_id` | `DataUtils.m86645J(getPwdId())` | `Integer.toHexString(1)` → `01` |
+| `pwd_id` | `DataUtils.m86645J(getPwdId())` | **`00` for a host** — see below |
 | `action` | `MessageManage` type flag | `01` = unlock, `02` = lock |
 | `str3` | **hub flag** | `01` when relayed by a hub, `00` for direct BLE |
 | `nonce` | `m86660o` | 8 bytes — see below |
@@ -496,6 +498,29 @@ to `HexUtils.m86802c`, which concatenates them with two rules that matter:
 Zero-pad to the next AES block boundary, then AES-128/ECB encrypt. The frame's
 type byte carries the zero-padding length in its high nibble and `5` (AES-128/ECB)
 in its low nibble.
+
+### `pwd_id` — the credential slot
+
+`getPwdId()` returns `"1"` when the bean's `pwdId` is unset, and that default is
+misleading: `LockerManager`, building the bean from stored lock data, assigns it
+explicitly for an admin —
+
+```java
+bluetoothBean.setHost(true);
+if (!myLockerBean.isSubAdmin()) {
+    bluetoothBean.setPwdId("0");
+}
+```
+
+so a host command carries slot **0**, not 1. `NewUnlockCmd`'s `0x52` branch does
+the same for hosts. Slot 0 is where the host credential actually lives, which
+§24 shows directly.
+
+> Sending the host password with slot `01` makes the lock look up a *different*
+> credential, compare the two, and reject the command with BLE error `FF`
+> ("wrong password") — behind a `cod=200` from the cloud. This was the second of
+> the two bugs that kept unlock from working; the first was `str3` below. Both
+> had to be correct simultaneously.
 
 ### `str3` — the hub flag
 
@@ -1069,15 +1094,128 @@ The CRC covers all bytes of the frame **including** the type byte, but **excludi
   hardware.
 - **Multiple frame formats.** Selected by a numeric lock type the lock reports in
   its status payload (`data[36:38]`), defaulting to 1. See §11 *Command variants*.
-- **MQTT `server` topic.** Confirmed refused (SUBACK `0x80`) with an email-only
-  username; see §17.
+- **The credential slot.** A host command carries `pwd_id` **0**, not the `"1"`
+  that `getPwdId()` returns by default — `LockerManager` assigns `"0"` for an
+  admin. Sending slot 1 with the host password is rejected as `FF`, "wrong
+  password". See §11.
+- **Where the host password lives.** Slot 0 of the lock's own credential list,
+  readable over `0x93` (§24). The cloud's `hc` is a copy that can fall behind,
+  though on the hardware tested here the two matched.
+- **MQTT authentication.** The broker wants a **client certificate**, not a
+  different username form: `MqttSSLSocketFactory` loads a CA, a client
+  certificate and a client private key into a `KeyManagerFactory` over TLSv1.2.
+  Without one, CONNECT is refused (`rc=5`), or accepted and then denied at
+  subscribe time (SUBACK `0x80`). See §17.
+- **Lock-side error codes.** Tabulated in §25. A rejection is a short
+  unencrypted frame with cmd-type `0C`; `cod=200` from the cloud says nothing
+  about whether the lock acted.
 
 ### Known unknowns
 
 - The `asyncsend` endpoint (async alternative to `senddata`) exists but is not used by this integration. The request format appears identical; the response is a callback rather than a synchronous ACK.
-- **MQTT username format** — the broker may require `{user_client_id}_{email}` rather than just the email. The `user_client_id` is a server-assigned ID stored in app SharedPreferences under `user_client_id_1208`. The HA integration uses email-only, the fallback codepath from `MqttConnectionOption.getUserName()`. Live testing now shows the email-only form connects (rc=0) but is refused at SUBACK, so this is the most likely remaining cause — see §17.
-- **MQTT topic name on broker** — `"server"` is the default `Message.TOPIC` value in the APK. Live testing shows the broker returns SUBACK `0x80` (refused) for this topic — see §17. Either the topic is per-user/per-device or the username form gates access to it.
 - **Guest PIN hardware activation** — whether `acu/save` auto-pushes the PIN to the lock hardware or whether a separate `acu/crdntl/pwList/active` call is required has not been confirmed by live testing.
 - **MPPS REST channel** — `apiserv04c.lockly.com/mpps/v1/channel` manages which channels an FCM-registered device subscribes to. This path requires Firebase Cloud Messaging and is not usable in HA. The Lockly Paho MQTT broker (§17) is the correct path for HA real-time push.
 - Some Lockly hardware generations use an older BLE command set (command `7` = `HostUnlockCmd`). The integration targets AES-capable locks (command `22` = `NewUnlockCmd`); older locks are untested.
 - The `lock/cachedstatus/get` response `time` field is a Unix timestamp in milliseconds. Values of 0 indicate the hub has never uploaded state for this lock.
+
+---
+
+## 24. Credential List — QueryPwd147 (0x93)
+
+Reads the credentials a lock actually holds. This matters because the cloud's
+`hc` field is only a *copy* of the host password — the app updates its own copy
+locally after a successful `SetHostPwdCmd` (`BindLockManager`), so `hc` can fall
+behind the lock. `QueryPwdUtil` asks the lock instead, and takes the entry whose
+`pwd_id` is 0 as the lock password.
+
+### Which query a lock uses
+
+`QueryPwdUtil` branches three ways, in this order:
+
+| Predicate | Path | Command |
+|---|---|---|
+| `isSupport100Passwords()` | PGI302W only | — |
+| `isSupport500GroupPassword()` | PGD728FN21, PGD238T | `QueryPwd167Cmd` |
+| `isSupport32GroupPassword()` | PGD628FN ≥ 4.03.01, others | **`QueryPwd147Cmd` (`0x93`)** |
+
+### Request
+
+```
+93  <mc_len>  <enc_mc>  <page>  <nonce>
+```
+
+Assembled by the same `HexUtils.m86802c` rules as §11, so a one-character field
+is left-padded and `page` is **hex** (page 10 is `0a`). Always uses the stored
+nonce — `QueryPwd147Cmd` does not take the `isSupportTimestamp()` branch.
+
+On a lock that is not shared by tenant access, `getTenantAccessAESKey`,
+`getTenantAccessEncryptMasterCode` and `getTenantAccessEncryptType` all fall
+back to the ordinary host derivations, so this reuses the same AES key and
+`enc_mc` as every other command.
+
+### Response
+
+Sent over `senddata` with no `directive`, and paginated. Decrypted layout:
+
+| Hex chars | Field |
+|---|---|
+| `0:2` | status — `00` is success |
+| `2:4` | total pages |
+| `4:6` | current page |
+| `6:8` | total credentials |
+| `8:10` | credentials in this page |
+| `10:` | entries |
+
+Repeat until `current page >= total pages`. Each entry:
+
+```
+user_type(1B)  pwd_size(1B)  password(pwd_size B)  pwd_id(1B)
+```
+
+followed by a 20-character schedule block on every entry **except** `pwd_id 0` —
+the host credential carries no schedule. On 500-group locks `pwd_id` is 2 bytes
+rather than 1.
+
+Passwords are digit-expanded as in §11, so decoding is `Cmd.getEvenString` in
+reverse — keep every second character (`090800070908` → `980798`).
+
+> **Bound the entry loop by the page's credential count.** The decrypted block is
+> zero-padded to the AES boundary, and 10 or more bytes of padding will otherwise
+> parse as a phantom `pwd_id 0` entry with an empty password.
+
+`QueryPwdCmd.NO_PASSWOED` (`a1b2c3d40a000c11019a`) is the sentinel for a lock
+holding none — a valid empty answer, not a failure.
+
+---
+
+## 25. Lock-side BLE Error Codes
+
+When the lock rejects a command it replies with a short, **unencrypted** frame
+whose cmd-type byte is `0C` rather than `0A`, followed by a single error byte.
+`Cmd.getErrorCode` reads that byte; `Cmd.getErrorInfo` maps it to a message.
+
+```
+A1B2C3D4 0A00 0C22 FF 98
+         len  type err crc
+```
+
+| Code | Meaning |
+|---|---|
+| `F0` | Too many 4-digit access codes (max 10; use 5–8 digits) |
+| `F1` | Battery too low for an OTA update |
+| `F5` | Bluetooth connection problem |
+| `F8` | Cannot change the password |
+| `F9` | This credential's valid period has not started yet |
+| `FA` | Lock reported a system error |
+| `FB` | A maximum has been reached |
+| `FD` | This door code has been used before |
+| `FE` | System error (present in Lockly Home 1.4.8; unhandled in 3.2.9) |
+| `FF` | **Wrong password** — the lock rejected the credential in the command |
+
+A success carries an AES-encrypted status block instead, and its first byte is
+`00` (`MessageManage.f55131l`).
+
+> **`cod=200` does not mean the lock acted.** It means the cloud accepted the
+> request and the hub relayed it. Always parse the ACK: a rejection is a short
+> frame, a success is a full AES block. Reporting `cod=200` as success is how a
+> silently-failing unlock can look like a working one.
