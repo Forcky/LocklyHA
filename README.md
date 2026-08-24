@@ -3,7 +3,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 [![GitHub Release](https://img.shields.io/github/v/release/Forcky/LocklyHA)](https://github.com/Forcky/LocklyHA/releases)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.3.0)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.4.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Control and monitor your **Lockly smart locks** from Home Assistant. This integration communicates with the Lockly cloud API using the same protocol as the official Lockly mobile app.
@@ -16,13 +16,13 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 
 | Feature | Status |
 |---|---|
-| Lock / Unlock from HA | ✅ |
+| Lock / Unlock from HA | 🚧 Frame corrected in 0.4.0, awaiting hardware confirmation |
 | Real-time lock state (locked / unlocked) | ✅ |
 | Battery low warning | ✅ |
 | Door sensor state (if fitted) | 🚧 In progress |
 | Last access / who entered | 🚧 In progress |
 | Guest PIN management (add / remove / list) | 🚧 In progress |
-| Real-time MQTT push (no-poll state updates) | 🚧 In progress |
+| Real-time MQTT push (no-poll state updates) | ❌ Broker refuses the subscription — see Known Limitations |
 | Multiple locks per account | ✅ |
 | Silent polling — lock does not beep during polls | ✅ |
 | Config flow UI | ✅ |
@@ -107,7 +107,7 @@ Results are returned as HA bus events: `lockly_guest_list`, `lockly_guest_added`
 
 ## Entities
 
-Each lock creates two entities:
+Each lock creates four entities:
 
 ### Lock entity
 
@@ -180,9 +180,10 @@ Credentials (email and password) are stored in HA's config entry. The integratio
 
 ## Known Limitations
 
-- **Bluetooth-only locks** (without a PGH hub) are not supported.
+- **Locks with no PGH hub are not supported.** This covers both Bluetooth-only locks and WiFi-native models such as the `PGD728FG25`, which connect straight to WiFi. The `senddata` endpoint relays commands through a hub, so with an empty `hubid` the cloud returns `cod=930` for both state and commands. The integration now detects this and says so rather than reporting a bare error code. Supporting these locks needs a different API path (tracked in issue #2).
+- **The lock command frame was wrong until 0.4.0.** The `str3` hub flag was sent as `00` instead of `01`, so locks NACKed every lock/unlock while the cloud still returned `cod=200`. Fixed and verified byte-for-byte against the decompiled app (`tests/test_frame.py`), but not yet confirmed against physical hardware — please report whether `lock.unlock` works on your model.
 - **Silent polling requires hub firmware build ≥ 422** (for major version 2 hubs). On older firmware, state only updates when commanded through HA or when the integration restarts.
-- **Real-time MQTT push is in progress**: The integration connects to the Lockly MQTT broker at startup using JWT auth. If connection is refused, state updates fall back to the 30-second poll. The exact username format required by the broker has not been verified against a live session; see [Enabling debug logs](#enabling-debug-logs) if MQTT fails to connect.
+- **Real-time MQTT push does not work yet.** The integration connects to the Lockly broker successfully (MQTT CONNECT returns rc=0), but the broker then refuses the subscription to the `server` topic with SUBACK `0x80`. So no push messages arrive and state falls back to polling. The likely cause is the username form — the app can use `{user_client_id}_{email}` where we send just the email. Tracked in [`docs/api.md`](docs/api.md) §17, which also notes a possible HTTP alternative (`v1/proto/handler`).
 - **Battery percentage is approximate** (binary low/normal flag only).
 - **Guest PIN activation is unverified**: `lockly.add_guest` creates the guest record on the Lockly cloud. Whether the PIN is automatically pushed to the lock hardware is not yet confirmed. If the PIN does not work physically, open an issue.
 - **Lock command** (`lock.lock`) has been implemented but not extensively tested across all Lockly hardware generations. If it does not close your lock, please open an issue with your lock model.

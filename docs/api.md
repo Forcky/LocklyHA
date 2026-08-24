@@ -332,7 +332,7 @@ def derive_aes_key(master_code: str, uuid: str) -> bytes:
 
     key = bytearray(16)
     for i in range(len(str(master_code))):      # 8 iterations for 8-digit mc
-        key[i] = uuid_bytes[i] ^ mc_bytes[i]
+        key[i] = uuid_bytes[i % len(uuid_bytes)] ^ mc_bytes[i]
     for i in range(8, 12):
         key[i] = uuid_bytes[i] ^ mc_bytes[i - 8]
     for i in range(12, 16):
@@ -465,38 +465,115 @@ wakeup_v      = wakeup_v_mv / 1000                                   # volts
 
 ## 11. NewUnlock Command
 
-**BLE command code:** `22` (NewUnlock, AES path for hub)  
-**senddata directive:** `"U"`
+**BLE command code:** `22` (NewUnlock, AES path) — but see *Command variants* below  
+**senddata directive:** `"unlock"`
 
-### Plaintext content
+### Field assembly
+
+`NewUnlockCmd.getData` builds the plaintext by passing an ordered argument list
+to `HexUtils.m86802c`, which concatenates them with two rules that matter:
+
+- a **one-character** argument is left-padded to two (`"2"` → `"02"`)
+- an **empty** argument is skipped entirely (`TextUtils.isEmpty`), so an absent
+  field disappears rather than becoming `00`
 
 ```
-22  <mc_len>  <enc_mc>  02  <pwd_expanded>  <pwd_id>  <time_hex>  01
+22  <mc_len>  <enc_mc>  <unlock_type>  <pwd>  <pwd_id>  <action>  <str3>  <nonce>
 ```
 
-| Field | Description |
-|---|---|
-| `22` | Command code |
-| `mc_len` | 1 byte |
-| `enc_mc` | 8 bytes (XOR-encoded mc) |
-| `02` | Unlock type: `02` = HOST (normal unlock) |
-| `pwd_expanded` | Password bytes (empty `""` for no password) |
-| `pwd_id` | 2-byte LE uint16 of `pwdId` — typically `0100` (pwdId=1) |
-| `time_hex` | 6-byte current time (yyMMddHHmmss) |
-| `01` | is_remote = 1 (hub) |
+| Field | Java source | Value |
+|---|---|---|
+| `22` | literal | Command code |
+| `mc_len` | `encryptMasterCode.length()/2` as **decimal** | `08` |
+| `enc_mc` | `getEncryptMasterCode()` | 8 bytes, mc XOR uuid |
+| `unlock_type` | `getUnLockType()` | `02` = host/admin, `03` = long-term or staff |
+| `pwd` | `HexUtils.m86803d(getLockPwd())` | the lock's `hc`, digit-expanded — `"980798"` → `090800070908` |
+| `pwd_id` | `DataUtils.m86645J(getPwdId())` | `Integer.toHexString(1)` → `01` |
+| `action` | `MessageManage` type flag | `01` = unlock, `02` = lock |
+| `str3` | **hub flag** | `01` when relayed by a hub, `00` for direct BLE |
+| `nonce` | `m86660o` | 8 bytes — see below |
 
-Zero-pad to next AES block boundary (32 bytes), then AES-128/ECB encrypt.
+Zero-pad to the next AES block boundary, then AES-128/ECB encrypt. The frame's
+type byte carries the zero-padding length in its high nibble and `5` (AES-128/ECB)
+in its low nibble.
 
-**Note on unlock type:**
-- `02` = HOST (standard remote unlock)
-- `03` = LONG_TERM / STAFF (used for guest/staff credentials)
+### `str3` — the hub flag
+
+This field decides nothing about the lock, but getting it wrong makes the lock
+reject the command. Three entry points set it:
+
+| Method | `str3` | Used for |
+|---|---|---|
+| `getDataForHub` | `"1"` | hub-relayed commands |
+| `getDataForBluetooth` | `"0"` | direct BLE from the phone |
+| `getDataForNetwork` | `"0"` | direct network send |
+
+`OpenCloseRepositoryImpl` picks `getDataForHub` whenever `isRemoteControl()` is
+set, and `NewLockCmd` calls it unconditionally. **Every cloud `senddata` command
+is hub-relayed, so `str3` is always `01`.**
+
+> This was the long-standing bug in this integration: it sent `00`, and the lock
+> silently NACKed every unlock. It is easy to miss because `cod=200` still comes
+> back — the cloud accepted the request and the hub relayed it; only the lock
+> refused. Always check the ACK frame, not just `cod`.
+
+### The nonce
+
+```java
+m86660o = isSupportTimestamp() ? DataUtils.m86660o(timestamp)
+                               : LockerConfig.m61192B(uuid)
+```
+
+On locks where `isSupportTimestamp()` is false, the field is a value the **lock
+itself** issued: `QueryLockStatusCmd` stores `data[38:54]` of the decrypted
+status payload into `SharedPreferences` under `ble_aes_random_numbers_1062`,
+keyed by lock uuid, and the next command replays it.
+
+So the sequence is: query status → keep bytes 19–26 of the plaintext → send them
+back in the next lock/unlock frame. The lock rotates the value as it is used, so
+refresh it with a status query immediately before commanding, or the command is
+rejected as stale. When no status response has ever been seen the field is
+omitted entirely.
+
+### Command variants
+
+Lockly hardware does not share one frame format. `NewUnlockCmd.getData` branches
+on `BluetoothBean` predicates, all of which resolve from a **numeric lock type**:
+
+| Predicate | Command | Difference |
+|---|---|---|
+| default | `22` | the layout above |
+| `isSupport82Cmd()` | **`52`** | `getUserId()` replaces `pwd_id`; encryptType 11/12/13 |
+| `isSupport500GroupPassword()` | `22` | extra `02` after the command code; `getCmdLenString()` for the slot |
+
+`isSupportTimestamp()` is `(isHost() && isVision()) || (isSupport82Cmd() && !isPGI301())`.
+
+`BluetoothBean.getLockType()` parses the bean's `lockType` field and **falls back
+to 1** when absent. `qrylknew` does not return `lockType` — the lock reports it
+itself, as byte 18 of the decrypted status payload (`data[36:38]`, read by
+`QueryLockStatusCmd`). Query status first, then build commands for the type it
+reports.
+
+Lock type numbers relevant to reported hardware:
+
+| Type | Model | Variant |
+|---|---|---|
+| 4 | PGD628F | `22` |
+| 21 | PGD628FN | `22` |
+| 124 | PGD728FG25 | `52` |
+| 125 | PGD728FNG25 | `52` |
+| 127 | PGD628FG25 | `52` |
+| 129 | PGD728FN21 | 500-group |
+| 121 | PGI301 | `52`, no timestamp |
+
+See `custom_components/lockly/capabilities.py` for the full ported sets.
 
 ---
 
 ## 12. NewLock Command
 
 **BLE command code:** `22` (same frame as NewUnlock, per APK analysis)  
-**senddata directive:** `"L"`
+**senddata directive:** `"lock"`
 
 `NewLockCmd.java` calls `NewUnlockCmd.getDataForHub(bluetoothBean, password, "2")` where `"2"` is `MessageManage.f55124e` (the lock-type flag vs `"1"` for unlock). The BLE frame structure is identical to §11; the server/hub uses the `directive` field to determine the intended operation.
 
@@ -522,7 +599,7 @@ The `para` field is DES3/ECB-encrypted JSON (§6):
   "dv":    "2d0023003030471333363838",
   "cmd":   "<BLE_frame_hex>",
   "mdna":  "M2T200434555",
-  "directive": "U"   // "U"=unlock, "L"=lock; omit for query
+  "directive": "unlock"  // "unlock" or "lock"; omit entirely for a status query
 }
 ```
 
@@ -791,7 +868,36 @@ The app's `MqttConnectionOption.getUserName()` returns `{user_client_id}_{email}
 
 ### Topic
 
-Subscribe to topic `"server"`. All messages use this single topic; message type is identified by `header.name` in the JSON payload.
+`"server"` is the default `Message.TOPIC` value in the APK. Message type is
+identified by `header.name` in the JSON payload.
+
+> **Verified 2026-08-24 — subscribing to `server` is refused.** With
+> `username = email` and `password = <jwt>`, the broker **accepts the TCP/TLS
+> connection and the MQTT CONNECT** (rc=0), then returns **SUBACK 0x80** for
+> `server` — i.e. subscription not authorised. So the credentials are good
+> enough to connect but not to subscribe on that topic. Either the username
+> needs the `{user_client_id}_{email}` form, or the topic is per-user/per-device
+> rather than the shared `server`.
+>
+> This is worth knowing because the failure is otherwise invisible: paho's
+> `on_connect` reports success and no message ever arrives. Log the SUBACK
+> return code (`on_subscribe`'s `granted_qos`) — a value of 128 means refused,
+> not "subscribed at QoS 128".
+
+### HTTP alternative — `v1/proto/handler`
+
+The app can carry the same protocol over plain HTTP:
+
+```
+POST /v1/proto/handler
+```
+
+`ApiService.m59007G` posts a `Payload<LockLogRequestData>` and receives
+`MqttHttpResponse`. This is a request/response transport for the same message
+envelope MQTT carries, which makes it a promising path for Home Assistant —
+no broker ACL to satisfy and no persistent connection to keep alive. The
+payload shape has not yet been worked out; see `data/mqtt/model/` in the
+decompiled sources.
 
 ### Message format
 
@@ -896,6 +1002,9 @@ Response codes appear in the `cod` field of all API responses. The `200` success
 | `900` | Hub-level system error — for `cachedstatus`, this means the hub firmware predates the feature |
 | `901` | No lock found |
 | `909` | Server cannot parse request — `para` field missing or not DES3-encrypted |
+| `910` | `para` sent unencrypted |
+| `920` | Endpoint rejected the request (seen on `lockly/syspara`) |
+| `930` | Hub/Secure LINK not associated with the lock. Reported by every user in issues #1 and #2 and on the HA forum. Two known causes: (a) the lock is not bound to a hub in the Lockly app; (b) the lock has **no hub at all** — WiFi-native models such as `PGD728FG25` connect directly to WiFi, so `hubid` is empty by construction and `senddata`, a hub-relay endpoint, cannot serve them |
 | `931` | Secure LINK already bound to another account |
 | `932` | Secure LINK does not exist |
 | `938` | Secure LINK ID coding format error |
@@ -948,11 +1057,26 @@ The CRC covers all bytes of the frame **including** the type byte, but **excludi
 | `BackupLockBean` | `…data.bean` | Lock JSON structure |
 | `SHA256Util` | `…utils` | Password hashing |
 
+### Resolved since the first draft
+
+- **The unlock frame.** `str3` is `01` for hub-relayed commands, not `00`; see §11.
+  The earlier draft of this document described the field as `is_remote` and the
+  integration hardcoded `00`, which made every unlock fail with a lock-side NACK
+  behind a `cod=200` response.
+- **The nonce.** It is the lock's own value from `data[38:54]` of the status
+  payload, cached by the app under `ble_aes_random_numbers_1062` per uuid, and
+  replayed in the next command. Not a timestamp on `isSupportTimestamp()==false`
+  hardware.
+- **Multiple frame formats.** Selected by a numeric lock type the lock reports in
+  its status payload (`data[36:38]`), defaulting to 1. See §11 *Command variants*.
+- **MQTT `server` topic.** Confirmed refused (SUBACK `0x80`) with an email-only
+  username; see §17.
+
 ### Known unknowns
 
 - The `asyncsend` endpoint (async alternative to `senddata`) exists but is not used by this integration. The request format appears identical; the response is a callback rather than a synchronous ACK.
-- **MQTT username format** — the broker may require `{user_client_id}_{email}` rather than just the email. The `user_client_id` is a server-assigned ID stored in app SharedPreferences under `user_client_id_1208`. The HA integration uses email-only as the fallback codepath from `MqttConnectionOption.getUserName()`, but this has not been verified against a live MQTT session.
-- **MQTT topic name on broker** — `"server"` is the default `Message.TOPIC` value in the APK. If the broker routes to per-device topics instead, the subscription will receive no messages. Subscribe to `#` with debug logging enabled on first deployment to confirm topic routing.
+- **MQTT username format** — the broker may require `{user_client_id}_{email}` rather than just the email. The `user_client_id` is a server-assigned ID stored in app SharedPreferences under `user_client_id_1208`. The HA integration uses email-only, the fallback codepath from `MqttConnectionOption.getUserName()`. Live testing now shows the email-only form connects (rc=0) but is refused at SUBACK, so this is the most likely remaining cause — see §17.
+- **MQTT topic name on broker** — `"server"` is the default `Message.TOPIC` value in the APK. Live testing shows the broker returns SUBACK `0x80` (refused) for this topic — see §17. Either the topic is per-user/per-device or the username form gates access to it.
 - **Guest PIN hardware activation** — whether `acu/save` auto-pushes the PIN to the lock hardware or whether a separate `acu/crdntl/pwList/active` call is required has not been confirmed by live testing.
 - **MPPS REST channel** — `apiserv04c.lockly.com/mpps/v1/channel` manages which channels an FCM-registered device subscribes to. This path requires Firebase Cloud Messaging and is not usable in HA. The Lockly Paho MQTT broker (§17) is the correct path for HA real-time push.
 - Some Lockly hardware generations use an older BLE command set (command `7` = `HostUnlockCmd`). The integration targets AES-capable locks (command `22` = `NewUnlockCmd`); older locks are untested.
