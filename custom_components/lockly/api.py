@@ -739,6 +739,56 @@ def describe_ble_error(code: str) -> str:
     return _BLE_ERRORS.get(str(code).upper(), "unknown lock error")
 
 
+async def api_get_heartbeat(
+    session: aiohttp.ClientSession,
+    jwt: str,
+    des3_key: bytes,
+    device_id: str,
+    model: str = "Pixel 8 Pro",
+) -> dict[str, Any] | None:
+    """Fetch the account's MQTT push configuration.
+
+    ``POST getHeartbeatTime`` returns ``{heartbeat, mqttConfigs}`` where
+    mqttConfigs is ``{clientId, host, port}`` (HeartbeatTimeApiResponse /
+    MqttConfigApiResponse).  The request carries the *client's* deviceId and
+    model, not a lock, which is why this looks like the app's own push channel
+    rather than per-lock configuration.
+
+    ``clientId`` is the only MQTT client id the API exposes, and
+    MqttConnectionOption can build its username as ``{user_client_id}_{email}``
+    — so this is the missing half of the broker's subscription authorisation.
+
+    Returns the parsed config, or None on failure.
+    """
+    req = {"deviceId": device_id, "model": model}
+    para = des3_encrypt(des3_key, json.dumps(req, separators=(",", ":")))
+    try:
+        async with session.post(
+            API_BASE + "getHeartbeatTime",
+            json={**COMMON_BODY, "para": para},
+            headers=_headers(jwt),
+        ) as resp:
+            body = await resp.json(content_type=None)
+            cod = str(body.get("cod"))
+            if cod != "200":
+                _LOGGER.warning(
+                    "getHeartbeatTime failed: cod=%s (%s)", cod, describe_cod(cod)
+                )
+                return None
+            cfg = body.get("mqttConfigs") or {}
+            result = {
+                "heartbeat": body.get("heartbeat"),
+                "client_id": cfg.get("clientId"),
+                "host": cfg.get("host"),
+                "port": cfg.get("port"),
+            }
+            _LOGGER.debug("getHeartbeatTime: %s", result)
+            return result
+    except Exception:
+        _LOGGER.exception("getHeartbeatTime request failed")
+        return None
+
+
 async def api_query_passwords(
     session: aiohttp.ClientSession,
     jwt: str,

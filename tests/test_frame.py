@@ -26,6 +26,7 @@ from custom_components.lockly.api import (
     parse_ack,
     parse_pwd_list_ack,
 )
+from custom_components.lockly import LocklyCoordinator
 from custom_components.lockly.capabilities import (
     LockCapabilities,
     resolve_capabilities,
@@ -258,6 +259,36 @@ def test_rejection_is_not_parsed_as_data() -> None:
           parse_pwd_list_ack("A1B2C3D40A000C93FF98", MC, UUID), None)
 
 
+def test_operator_resolution() -> None:
+    """Resolving who triggered an access event from the credential slot.
+
+    Keypad and fingerprint events carry an empty ``na``, so the only identifying
+    field is ``pid``.  Slot numbers are namespaced per credential type, so the
+    same slot can map to two users and must not be guessed.
+    """
+    print("operator resolution")
+    resolve = LocklyCoordinator._resolve_operator
+
+    # Garage side door: one fingerprint at slot 7, one passcode at slot 1.
+    lock = {"usrarr": [
+        {"dutype": "F", "pid": 7, "fn": "Pat", "ln": ""},
+        {"dutype": "P", "pid": 1, "fn": "Holly", "ln": "Forck"},
+    ]}
+    check("fingerprint slot resolves", resolve(lock, {"na": "", "pid": 7})[0], "Pat")
+    check("passcode slot resolves", resolve(lock, {"na": "", "pid": 1})[0], "Holly Forck")
+    check("an explicit na wins", resolve(lock, {"na": "Someone", "pid": 7})[0], "Someone")
+    check("unknown slot is unresolved", resolve(lock, {"na": "", "pid": 99})[0], None)
+
+    # Front Door: slot 1 exists as both a fingerprint and a passcode.
+    ambiguous = {"usrarr": [
+        {"dutype": "F", "pid": 1, "fn": "Pat", "ln": ""},
+        {"dutype": "P", "pid": 1, "fn": "Holly", "ln": "Forck"},
+    ]}
+    name, candidates = resolve(ambiguous, {"na": "", "pid": 1})
+    check("ambiguous slot is not guessed", name, None)
+    check("ambiguous candidates reported", candidates, ["Holly Forck", "Pat"])
+
+
 def main() -> int:
     for test in (
         test_unlock_plaintext,
@@ -272,6 +303,7 @@ def main() -> int:
         test_user_type_2_has_no_schedule,
         test_no_passwords_sentinel,
         test_rejection_is_not_parsed_as_data,
+        test_operator_resolution,
     ):
         test()
     print()
