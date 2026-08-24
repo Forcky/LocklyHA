@@ -419,8 +419,12 @@ def parse_pwd_list_ack(
             result["entries"].append(
                 {"user_type": user_type, "pwd_id": pwd_id, "password": password}
             )
-            # Only non-host entries carry the trailing schedule block.
-            rest = rest[id_end:] if pwd_id == 0 else rest[id_end + 20:]
+            # QueryPwdCmd.parseData skips the 10-byte schedule block when the
+            # credential is the host (pwd_id 0) or user_type is 2.  Getting this
+            # wrong consumes bytes belonging to the next entry and misaligns
+            # every credential after it.
+            has_schedule = pwd_id != 0 and user_type != 2
+            rest = rest[id_end + 20:] if has_schedule else rest[id_end:]
         return result
     except Exception:
         _LOGGER.exception("Failed to parse password list ACK: %s", ack_hex[:60])

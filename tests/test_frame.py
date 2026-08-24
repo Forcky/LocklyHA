@@ -219,6 +219,29 @@ def test_pwd_list_ignores_padding() -> None:
     check("password is real", parsed["entries"][0]["password"] if parsed else "", "1234")
 
 
+def test_user_type_2_has_no_schedule() -> None:
+    """user_type 2 skips the schedule block, like the host does.
+
+    Getting this wrong swallows 10 bytes of the following entry and misaligns
+    every credential after it — which is how a real lock reporting slots
+    [0, 1, 7] came back as [0, 1] with duplicates.
+    """
+    print("user_type 2 skips schedule")
+    host = "01" + "06" + "090800070908" + "00"           # slot 0, no schedule
+    utype2 = "02" + "04" + "01020304" + "03"             # user_type 2, no schedule
+    normal = "01" + "04" + "05060708" + "07" + "F" * 20  # slot 7, with schedule
+    header = "00" + "01" + "01" + "03" + "03"
+    parsed = parse_pwd_list_ack(_wrap_response(header + host + utype2 + normal), MC, UUID)
+
+    check("parsed", parsed is not None, True)
+    if not parsed:
+        return
+    slots = [e["pwd_id"] for e in parsed["entries"]]
+    check("all three slots, in order", slots, [0, 3, 7])
+    check("user_type 2 password", parsed["entries"][1]["password"], "1234")
+    check("trailing entry still aligned", parsed["entries"][2]["password"], "5678")
+
+
 def test_no_passwords_sentinel() -> None:
     """The NO_PASSWOED frame is a valid empty answer, not a parse failure."""
     print("no-passwords sentinel")
@@ -246,6 +269,7 @@ def main() -> int:
         test_query_pwd_frame,
         test_pwd_list_parsing,
         test_pwd_list_ignores_padding,
+        test_user_type_2_has_no_schedule,
         test_no_passwords_sentinel,
         test_rejection_is_not_parsed_as_data,
     ):
