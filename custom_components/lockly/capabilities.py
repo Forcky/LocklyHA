@@ -23,9 +23,13 @@ from dataclasses import dataclass
 
 # ── Command codes ─────────────────────────────────────────────────────────────
 
-CMD_QUERY_STATUS = "1E"   # MessageManage.CODE_NEW_QUERY_LOCK_STATUS
-CMD_UNLOCK = "22"         # NewUnlockCmd, standard AES path
-CMD_UNLOCK_82 = "52"      # NewUnlockCmd, isSupport82Cmd path
+CMD_QUERY_STATUS = "1E"     # MessageManage.CODE_NEW_QUERY_LOCK_STATUS
+CMD_UNLOCK = "22"           # NewUnlockCmd, standard AES path
+CMD_UNLOCK_82 = "52"        # NewUnlockCmd, isSupport82Cmd path
+CMD_QUERY_PASSWORDS = "93"  # QueryPwd147Cmd — paginated credential list
+
+# QueryPwdCmd.NO_PASSWOED: the sentinel frame meaning "this lock holds none".
+_NO_PASSWORDS_ACK = "a1b2c3d40a000c11019a"
 
 # ── Frame field values ────────────────────────────────────────────────────────
 

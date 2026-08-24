@@ -13,10 +13,12 @@ from Crypto.Cipher import AES, DES3
 from Crypto.PublicKey import RSA
 
 from .capabilities import (
+    _NO_PASSWORDS_ACK,
     _STR3_DIRECT,
     _STR3_HUB,
     ACTION_LOCK,
     ACTION_UNLOCK,
+    CMD_QUERY_PASSWORDS,
     CMD_QUERY_STATUS,
     DEFAULT_CAPABILITIES,
     UNLOCK_TYPE_HOST,
@@ -306,6 +308,123 @@ def build_lock_cmd(
         nonce=nonce,
         slot_id=(caps or DEFAULT_CAPABILITIES).slot_id,
     )
+
+
+def build_query_pwd_cmd(
+    master_code: str,
+    uuid: str,
+    position: int = 0,
+    nonce: str | None = None,
+) -> str:
+    """Build a QueryPwd147 (0x93) frame — reads the lock's credential list.
+
+    QueryPwd147Cmd.getData assembles: cmd + mc_len + enc_mc + position + nonce.
+    It always uses the stored nonce, not the timestamp branch.
+
+    On a lock that is not shared via tenant access, getTenantAccessAESKey /
+    getTenantAccessEncryptMasterCode / getTenantAccessEncryptType all fall back
+    to the ordinary host derivations, so this reuses the same key and enc_mc as
+    every other command.
+
+    The response is paginated; ``position`` is the page index.
+    """
+    enc_mc = encrypt_master_code(master_code, uuid)
+    raw = _assemble_fields(
+        CMD_QUERY_PASSWORDS,
+        f"{len(enc_mc) // 2:d}",
+        enc_mc,
+        f"{position:x}",
+        (nonce or "").upper(),
+    )
+    return _aes_wrap(raw, derive_aes_key(master_code, uuid))
+
+
+def _decode_pwd_digits(hex_str: str) -> str:
+    """Reverse HexUtils.m86803d — Cmd.getEvenString keeps every second character.
+
+    "090800070908" -> "980798"
+    """
+    return hex_str[1::2]
+
+
+def parse_pwd_list_ack(
+    ack_hex: str,
+    master_code: str,
+    uuid: str,
+    five_hundred_group: bool = False,
+) -> dict[str, Any] | None:
+    """Parse a QueryPwd147 (0x93) response into credential entries.
+
+    Decrypted layout (QueryPwd147Cmd.parseCmd):
+
+        [0:2]  status — "00" is success
+        [2:4]  total pages
+        [4:6]  current page
+        [6:8]  total credentials
+        [8:10] credentials in this page
+        [10:]  entries, parsed by QueryPwdCmd.parseData
+
+    Each entry (QueryPwdCmd.parseData):
+
+        user_type(1B) | pwd_size(1B) | password(pwd_size B) | pwd_id(1B)
+
+    followed by a 20-character schedule block, except when pwd_id is 0 — the
+    host credential carries no schedule.  ``pwd_id == 0`` is the host password:
+    QueryPwdUtil picks exactly that entry as the lock password.
+    """
+    h = ack_hex.upper()
+    if h.lower() == _NO_PASSWORDS_ACK:
+        return {"status_ok": True, "entries": [], "is_end": True, "total": 0}
+    try:
+        payload = bytes.fromhex(h[16:-2])
+        if len(payload) == 0 or len(payload) % 16 != 0:
+            code = h[16:18]
+            _LOGGER.debug(
+                "query passwords rejected: %s — %s", code, describe_ble_error(code)
+            )
+            return None
+        d = AES.new(derive_aes_key(master_code, uuid), AES.MODE_ECB).decrypt(payload).hex()
+        if len(d) < 10 or d[0:2] != "00":
+            _LOGGER.debug("query passwords: status %s", d[0:2] if d else "(empty)")
+            return None
+
+        total_pages = int(d[2:4], 16)
+        cur_page = int(d[4:6], 16)
+        result: dict[str, Any] = {
+            "status_ok": True,
+            "total_pages": total_pages,
+            "cur_page": cur_page,
+            "total": int(d[6:8], 16),
+            "page_count": int(d[8:10], 16),
+            "is_end": cur_page >= total_pages,
+            "entries": [],
+        }
+
+        rest = d[10:]
+        # parseData loops while at least 20 characters remain, but the block is
+        # zero-padded to the AES boundary and 10+ bytes of padding would parse as
+        # a bogus slot-0 entry.  The page's own credential count bounds it.
+        page_count = result["page_count"]
+        while len(rest) >= 20 and len(result["entries"]) < page_count:
+            user_type = int(rest[0:2], 16)
+            pwd_size = int(rest[2:4], 16)
+            pwd_end = 4 + pwd_size * 2
+            password = _decode_pwd_digits(rest[4:pwd_end])
+            if five_hundred_group:
+                id_end = pwd_end + 4
+                pwd_id = int(rest[pwd_end:id_end], 16)
+            else:
+                id_end = pwd_end + 2
+                pwd_id = int(rest[pwd_end:id_end], 16)
+            result["entries"].append(
+                {"user_type": user_type, "pwd_id": pwd_id, "password": password}
+            )
+            # Only non-host entries carry the trailing schedule block.
+            rest = rest[id_end:] if pwd_id == 0 else rest[id_end + 20:]
+        return result
+    except Exception:
+        _LOGGER.exception("Failed to parse password list ACK: %s", ack_hex[:60])
+        return None
 
 
 def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
@@ -616,6 +735,85 @@ def describe_ble_error(code: str) -> str:
     return _BLE_ERRORS.get(str(code).upper(), "unknown lock error")
 
 
+async def api_query_passwords(
+    session: aiohttp.ClientSession,
+    jwt: str,
+    email: str,
+    des3_key: bytes,
+    lock: dict,
+    nonce: str | None = None,
+    caps: LockCapabilities | None = None,
+    max_pages: int = 16,
+) -> list[dict] | None:
+    """Read the lock's credential list via QueryPwd147 (0x93).
+
+    The cloud's ``hc`` field is only a copy of the host password, and the app
+    updates its own copy locally whenever the host code is changed on the lock
+    (BindLockManager after SetHostPwdCmd).  So ``hc`` can fall behind the lock.
+    This asks the lock directly, the way the app does.
+
+    Returns the credential entries, or None if the query failed.  The host
+    password is the entry whose ``pwd_id`` is 0.
+    """
+    mc = str(lock["mc"])
+    uuid = lock["ID"]
+    five_hundred = bool((caps or DEFAULT_CAPABILITIES).supports_500_group_password)
+
+    entries: list[dict] = []
+    position = 0
+    for _ in range(max_pages):
+        cmd_hex = build_query_pwd_cmd(mc, uuid, position=position, nonce=nonce)
+        req = {
+            "acct": email,
+            "hubid": lock.get("hubid", ""),
+            "dv": uuid,
+            "cmd": cmd_hex,
+            "mdna": lock.get("iotdm", ""),
+        }
+        para = des3_encrypt(des3_key, json.dumps(req, separators=(",", ":")))
+        try:
+            async with session.post(
+                API_BASE + "senddata",
+                json={**COMMON_BODY, "para": para},
+                headers=_headers(jwt),
+                timeout=aiohttp.ClientTimeout(total=SENDDATA_TIMEOUT),
+            ) as resp:
+                body = await resp.json(content_type=None)
+                cod = str(body.get("cod"))
+                if cod != "200" or "ACK" not in body:
+                    _LOGGER.warning(
+                        "query passwords failed: cod=%s lock=%s page=%d (%s)",
+                        cod, lock.get("blename"), position, describe_cod(cod),
+                    )
+                    return None
+                page = parse_pwd_list_ack(body["ACK"], mc, uuid, five_hundred)
+                if page is None:
+                    return None
+        except Exception:
+            _LOGGER.exception(
+                "query passwords request failed for lock %s", lock.get("blename")
+            )
+            return None
+
+        entries.extend(page.get("entries") or [])
+        if page.get("is_end", True):
+            break
+        position = int(page.get("cur_page", position)) + 1
+
+    return entries
+
+
+def host_password_from(entries: list[dict]) -> str | None:
+    """Pick the host credential out of a queried list.
+
+    QueryPwdUtil.m87342t returns the entry whose pwd_id is 0.
+    """
+    for entry in entries or []:
+        if entry.get("pwd_id") == 0:
+            return entry.get("password") or None
+    return None
+
+
 def _ack_reports_success(ack_hex: str, master_code: str, uuid: str) -> tuple[bool, str]:
     """Decide whether a lock/unlock ACK means the lock actually acted.
 
@@ -722,10 +920,11 @@ async def api_unlock(
     lock: dict,
     nonce: str | None = None,
     caps: LockCapabilities | None = None,
+    lock_pwd_override: str | None = None,
 ) -> bool:
     """Send unlock command. Returns True if the lock acknowledged."""
     mc = str(lock["mc"])
-    lock_pwd = str(lock.get("hc") or "")
+    lock_pwd = lock_pwd_override if lock_pwd_override is not None else str(lock.get("hc") or "")
     return await _api_send_directive(
         session, jwt, email, des3_key, lock, "unlock",
         build_unlock_cmd(mc, lock["ID"], lock_pwd, nonce, caps=caps),
@@ -740,10 +939,11 @@ async def api_lock(
     lock: dict,
     nonce: str | None = None,
     caps: LockCapabilities | None = None,
+    lock_pwd_override: str | None = None,
 ) -> bool:
     """Send lock command. Returns True if the lock acknowledged."""
     mc = str(lock["mc"])
-    lock_pwd = str(lock.get("hc") or "")
+    lock_pwd = lock_pwd_override if lock_pwd_override is not None else str(lock.get("hc") or "")
     return await _api_send_directive(
         session, jwt, email, des3_key, lock, "lock",
         build_lock_cmd(mc, lock["ID"], lock_pwd, nonce, caps=caps),

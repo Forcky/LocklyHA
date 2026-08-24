@@ -23,7 +23,9 @@ from .api import (
     api_lock,
     api_login,
     api_query_lock_status,
+    api_query_passwords,
     api_unlock,
+    host_password_from,
 )
 from .capabilities import LockCapabilities, resolve_capabilities
 from .mqtt import LocklyMQTTManager
@@ -105,6 +107,9 @@ class LocklyCoordinator(DataUpdateCoordinator):
         self._capabilities: dict[str, LockCapabilities] = {}
         # Last nonce each lock returned; replayed in the next command it receives.
         self._nonces: dict[str, str] = {}
+        # Host password read from each lock, which is authoritative over the
+        # cloud's "hc" copy.  None means "queried and the lock had no slot 0".
+        self._host_passwords: dict[str, str | None] = {}
 
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
@@ -254,16 +259,52 @@ class LocklyCoordinator(DataUpdateCoordinator):
             )
         return self._nonces.get(lock_id)
 
+    async def _resolve_host_password(self, lock: dict, nonce: str | None) -> str | None:
+        """Read the host password from the lock, caching it for the session.
+
+        The cloud's ``hc`` is a copy that the app updates locally whenever the
+        host code changes on the lock, so it can be stale — and a stale password
+        is rejected with BLE error FF ("wrong password").  Asking the lock is
+        what the app itself does; ``hc`` stays as the fallback.
+        """
+        lock_id = lock["ID"]
+        if lock_id in self._host_passwords:
+            return self._host_passwords[lock_id]
+
+        entries = await api_query_passwords(
+            self._session, self.jwt, self.email, self.des3_key, lock,
+            nonce=nonce, caps=self._caps_for(lock),
+        )
+        if entries is None:
+            # Do not cache a failure — a transient hub timeout should be retried.
+            return None
+
+        host_pwd = host_password_from(entries)
+        self._host_passwords[lock_id] = host_pwd
+        cloud_hc = str(lock.get("hc") or "")
+        _LOGGER.warning(
+            "Lockly: lock %s reports %d credential(s), slots %s; host slot 0 "
+            "present=%s, matches cloud hc=%s",
+            lock.get("blename") or lock_id,
+            len(entries),
+            sorted({e.get("pwd_id") for e in entries}),
+            host_pwd is not None,
+            (host_pwd == cloud_hc) if host_pwd is not None else "n/a",
+        )
+        return host_pwd
+
     async def _send_command(self, lock_id: str, *, unlock: bool) -> bool:
         lock = self._get_lock(lock_id)
         if lock is None:
             _LOGGER.warning("Lockly: lock_id %s is not in the discovered lock list", lock_id)
             return False
         nonce = await self._refresh_nonce(lock)
+        host_pwd = await self._resolve_host_password(lock, nonce)
         action = api_unlock if unlock else api_lock
         ok = await action(
             self._session, self.jwt, self.email, self.des3_key, lock,
             nonce=nonce, caps=self._caps_for(lock),
+            lock_pwd_override=host_pwd,
         )
         if ok:
             self._set_optimistic_lock_state(lock_id, is_locked=not unlock)
@@ -429,6 +470,31 @@ def _register_services(hass: HomeAssistant, coordinator: LocklyCoordinator) -> N
             "success": ok,
         })
 
+    async def handle_query_passwords(call) -> None:
+        """Diagnostic: read the lock's credential list and report what it holds.
+
+        Reports slot numbers and whether the host slot matches the cloud's copy.
+        The passwords themselves are deliberately not logged or published.
+        """
+        lock_id = call.data["lock_id"]
+        lock = coordinator._get_lock(lock_id)
+        if lock is None:
+            _LOGGER.error("query_passwords: lock_id %s not found", lock_id)
+            return
+        # Forget any cached answer so the service always re-reads the lock.
+        coordinator._host_passwords.pop(lock_id, None)
+        nonce = await coordinator._refresh_nonce(lock)
+        host_pwd = await coordinator._resolve_host_password(lock, nonce)
+        hass.bus.async_fire("lockly_passwords_queried", {
+            "lock_id": lock_id,
+            "lock_name": lock.get("na") or lock.get("blename") or lock_id,
+            "host_slot_found": host_pwd is not None,
+            "matches_cloud_hc": (
+                host_pwd == str(lock.get("hc") or "") if host_pwd is not None else None
+            ),
+        })
+
+    hass.services.async_register(DOMAIN, "query_passwords", handle_query_passwords, schema=_LIST_GUESTS_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_LIST_GUESTS,  handle_list_guests,  schema=_LIST_GUESTS_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_ADD_GUEST,    handle_add_guest,    schema=_ADD_GUEST_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_DELETE_GUEST, handle_delete_guest, schema=_DELETE_GUEST_SCHEMA)

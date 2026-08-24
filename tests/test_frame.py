@@ -16,12 +16,15 @@ from Crypto.Cipher import AES
 
 from custom_components.lockly.api import (
     build_lock_cmd,
+    build_query_pwd_cmd,
     build_query_status_cmd,
     build_unlock_cmd,
     crc8_lockly,
     derive_aes_key,
     encrypt_master_code,
+    host_password_from,
     parse_ack,
+    parse_pwd_list_ack,
 )
 from custom_components.lockly.capabilities import (
     LockCapabilities,
@@ -155,6 +158,82 @@ def test_capabilities() -> None:
     check("fallback uses 0x22", resolve_capabilities({"mod": "PGD999XX"}).cmd_code, "22")
 
 
+def _wrap_response(plaintext_hex: str, cmd_type: str = "0A93") -> str:
+    """Build a synthetic lock response frame around an AES-encrypted payload."""
+    remainder = (len(plaintext_hex) // 2) % 16
+    padded = plaintext_hex + ("" if remainder == 0 else "00" * (16 - remainder))
+    enc = AES.new(derive_aes_key(MC, UUID), AES.MODE_ECB).encrypt(bytes.fromhex(padded))
+    total = len(enc) + 8
+    body = (
+        bytes([0xA1, 0xB2, 0xC3, 0xD4])
+        + bytes([total % 256, total // 256])
+        + bytes.fromhex(cmd_type)
+        + enc
+    )
+    return (body + bytes([crc8_lockly(body)])).hex().upper()
+
+
+def test_query_pwd_frame() -> None:
+    """The 0x93 credential-list request layout."""
+    print("query passwords frame (0x93)")
+    enc_mc = encrypt_master_code(MC, UUID)
+    plaintext = decrypt_frame(build_query_pwd_cmd(MC, UUID, 0, NONCE), MC, UUID)
+    expected = "93" + "08" + enc_mc + "00" + NONCE
+    check("plaintext prefix", plaintext[:len(expected)], expected)
+    # Page index is a hex field, so page 10 is "0a", not "10".
+    page10 = decrypt_frame(build_query_pwd_cmd(MC, UUID, 10, NONCE), MC, UUID)
+    check("page index is hex", page10[20:22], "0A")
+
+
+def test_pwd_list_parsing() -> None:
+    """Credential entries, including the host slot's missing schedule block."""
+    print("password list parsing")
+    host = "01" + "06" + "090800070908" + "00"          # slot 0, no schedule
+    guest = "02" + "04" + "01020304" + "07" + "0" * 20  # slot 7, with schedule
+    header = "00" + "01" + "01" + "02" + "02"           # ok, 1 page, page 1, 2 creds
+    parsed = parse_pwd_list_ack(_wrap_response(header + host + guest), MC, UUID)
+
+    check("parsed", parsed is not None, True)
+    if not parsed:
+        return
+    check("total credentials", parsed["total"], 2)
+    check("is_end", parsed["is_end"], True)
+    check("entry count", len(parsed["entries"]), 2)
+    check("host slot id", parsed["entries"][0]["pwd_id"], 0)
+    check("host password decoded", parsed["entries"][0]["password"], "980798")
+    check("guest slot id", parsed["entries"][1]["pwd_id"], 7)
+    check("guest password decoded", parsed["entries"][1]["password"], "1234")
+    check("host_password_from picks slot 0",
+          host_password_from(parsed["entries"]), "980798")
+
+
+def test_pwd_list_ignores_padding() -> None:
+    """Zero padding must not become a phantom slot-0 credential."""
+    print("password list padding")
+    # One short entry, so the AES block leaves >10 bytes of zero padding.
+    header = "00" + "01" + "01" + "01" + "01"
+    entry = "01" + "04" + "01020304" + "00"
+    parsed = parse_pwd_list_ack(_wrap_response(header + entry), MC, UUID)
+    check("exactly one entry", len(parsed["entries"]) if parsed else -1, 1)
+    check("password is real", parsed["entries"][0]["password"] if parsed else "", "1234")
+
+
+def test_no_passwords_sentinel() -> None:
+    """The NO_PASSWOED frame is a valid empty answer, not a parse failure."""
+    print("no-passwords sentinel")
+    parsed = parse_pwd_list_ack("a1b2c3d40a000c11019a", MC, UUID)
+    check("recognised", parsed is not None, True)
+    check("no entries", parsed["entries"] if parsed else None, [])
+    check("host password is None", host_password_from([]), None)
+
+
+def test_rejection_is_not_parsed_as_data() -> None:
+    """A lock rejection must not be mistaken for a credential list."""
+    print("rejection handling")
+    check("FF rejection returns None",
+          parse_pwd_list_ack("A1B2C3D40A000C93FF98", MC, UUID), None)
+
+
 def main() -> int:
     for test in (
         test_unlock_plaintext,
@@ -163,6 +242,11 @@ def main() -> int:
         test_status_frame_unchanged,
         test_ack_parse_real_capture,
         test_capabilities,
+        test_query_pwd_frame,
+        test_pwd_list_parsing,
+        test_pwd_list_ignores_padding,
+        test_no_passwords_sentinel,
+        test_rejection_is_not_parsed_as_data,
     ):
         test()
     print()
