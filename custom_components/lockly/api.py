@@ -595,6 +595,27 @@ async def api_query_lock_status(
         return None
 
 
+# Lock-side error codes, from Cmd.getErrorInfo() and res/values/strings.xml.
+# These appear as a single unencrypted byte at ack_hex[16:18] when the lock
+# rejects a command.
+_BLE_ERRORS = {
+    "F0": "too many 4-digit access codes (max 10; use 5-8 digits)",
+    "F1": "battery too low for an OTA update",
+    "F5": "Bluetooth connection problem — try again later",
+    "F8": "cannot change the password",
+    "F9": "this credential's valid time period has not started yet",
+    "FA": "lock reported a system error",
+    "FB": "a maximum has been reached",
+    "FD": "this door code has been used before",
+    "FF": "wrong password — the lock rejected the credential in the command",
+}
+
+
+def describe_ble_error(code: str) -> str:
+    """Human-readable meaning for a lock-side BLE error byte."""
+    return _BLE_ERRORS.get(str(code).upper(), "unknown lock error")
+
+
 def _ack_reports_success(ack_hex: str, master_code: str, uuid: str) -> tuple[bool, str]:
     """Decide whether a lock/unlock ACK means the lock actually acted.
 
@@ -602,14 +623,23 @@ def _ack_reports_success(ack_hex: str, master_code: str, uuid: str) -> tuple[boo
     The lock's own verdict is in the ACK frame, so a NACK must not be reported to
     Home Assistant as a successful unlock.
 
+    A rejection comes back as a short, unencrypted frame whose cmd-type byte is
+    ``0C`` rather than ``0A``, followed by one error byte (``Cmd.getErrorCode``
+    reads exactly this offset). A success carries an AES-encrypted status block.
+
     Returns (accepted, detail).
     """
     if not ack_hex:
         return False, "no ACK returned"
+    h = ack_hex.upper()
     try:
-        payload = bytes.fromhex(ack_hex.upper()[16:-2])
-        if len(payload) == 0 or len(payload) % 16 != 0:
-            return False, f"lock NACK (unaligned ACK payload, {len(payload)}B)"
+        payload = bytes.fromhex(h[16:-2])
+        if len(payload) == 0:
+            return False, "lock returned an empty ACK"
+        if len(payload) % 16 != 0:
+            # Short frame = rejection; the first payload byte is the error code.
+            code = h[16:18]
+            return False, f"lock rejected the command: {code} — {describe_ble_error(code)}"
         d = AES.new(derive_aes_key(master_code, uuid), AES.MODE_ECB).decrypt(payload).hex()
         status = int(d[8:10], 16) if len(d) >= 10 else None
         return True, f"lock ACK status=0x{status:02X}" if status is not None else "lock ACK"
