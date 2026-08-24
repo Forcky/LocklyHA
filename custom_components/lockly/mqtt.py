@@ -5,6 +5,7 @@ import json
 import logging
 import ssl
 import uuid
+from pathlib import Path
 
 import paho.mqtt.client as paho
 from homeassistant.core import HomeAssistant
@@ -14,6 +15,16 @@ _LOGGER = logging.getLogger(__name__)
 _BROKER = "mqttuswest02-lb-001-b5ed8c5e37b3a497.elb.us-west-2.amazonaws.com"
 _PORT = 8883
 _TOPIC = "server"
+
+# Client-certificate material for the broker, taken from res/raw of the Lockly
+# app (3.2.9): R.raw.ca, R.raw.client and R.raw.client_key, the three files
+# MqttSSLSocketFactory loads.  They are shipped in every copy of the app, so
+# they are not a secret — but they do identify a Lockly client, and Lockly could
+# rotate them, in which case push stops until these are refreshed.
+_CERT_DIR = Path(__file__).parent / "certs"
+_CA_CERT = _CERT_DIR / "ca.crt"
+_CLIENT_CERT = _CERT_DIR / "client.crt"
+_CLIENT_KEY = _CERT_DIR / "client_key.key"
 
 
 class LocklyMQTTManager:
@@ -37,6 +48,16 @@ class LocklyMQTTManager:
     async def async_start(self) -> None:
         jwt = self._coordinator.jwt
         email = self._coordinator.email
+
+        missing = [p.name for p in (_CA_CERT, _CLIENT_CERT, _CLIENT_KEY) if not p.is_file()]
+        if missing:
+            _LOGGER.warning(
+                "Lockly MQTT: missing client certificate file(s) %s in %s — the "
+                "broker requires client-certificate auth, so push is disabled "
+                "and state falls back to polling",
+                ", ".join(missing), _CERT_DIR,
+            )
+            return
         # Unique client ID per integration instance; reuse avoids duplicate-session kicks.
         client_id = str(uuid.uuid4()).replace("-", "")
 
@@ -61,7 +82,21 @@ class LocklyMQTTManager:
                 _LOGGER.warning("Lockly MQTT disconnected unexpectedly rc=%s", rc)
 
         def on_subscribe(client, userdata, mid, granted_qos, properties=None):
-            _LOGGER.info("Lockly MQTT subscription confirmed (qos=%s)", granted_qos)
+            # A granted QoS of 0x80 is the MQTT "subscription failure" return
+            # code, not a QoS level.  Reporting it as a confirmation hides the
+            # fact that no messages will ever arrive.
+            codes = list(granted_qos or [])
+            if any(int(c) == 0x80 for c in codes):
+                _LOGGER.warning(
+                    "Lockly MQTT: broker REFUSED the subscription to %r "
+                    "(SUBACK 0x80) — connected, but no push messages will "
+                    "arrive; state falls back to polling",
+                    _TOPIC,
+                )
+            else:
+                _LOGGER.info(
+                    "Lockly MQTT subscribed to %r at qos=%s", _TOPIC, codes
+                )
 
         def on_message(client, userdata, msg):
             try:
@@ -100,11 +135,27 @@ class LocklyMQTTManager:
             cli.on_message = on_message
             self._client = cli
 
-            # tls_set loads the CA store from disk — blocking I/O, so it must not
-            # run on the event loop.  Lockly's broker presents a self-signed
-            # chain, so verification is disabled.
+            # The broker requires client-certificate authentication.  The app's
+            # MqttSSLSocketFactory loads a CA, a client certificate and a client
+            # private key into a KeyManagerFactory over TLSv1.2; connecting
+            # without the client certificate is refused with rc=5, or accepted
+            # and then denied at subscribe time with SUBACK 0x80.
+            #
+            # tls_set reads all three files from disk, so it must not run on the
+            # event loop.  Hostname verification stays off: the broker is an AWS
+            # ELB address and the certificate is issued by Lockly's own CA, so
+            # the name will not match.  The chain itself is still verified
+            # against that CA.
             await self._hass.async_add_executor_job(
-                lambda: cli.tls_set(cert_reqs=ssl.CERT_NONE)
+                # tls_version is left at paho's default rather than pinned to
+                # TLSv1.2 as the app does: that constant is deprecated, and the
+                # default negotiates 1.2 with this broker anyway.
+                lambda: cli.tls_set(
+                    ca_certs=str(_CA_CERT),
+                    certfile=str(_CLIENT_CERT),
+                    keyfile=str(_CLIENT_KEY),
+                    cert_reqs=ssl.CERT_REQUIRED,
+                )
             )
             await self._hass.async_add_executor_job(cli.tls_insecure_set, True)
             await self._hass.async_add_executor_job(
