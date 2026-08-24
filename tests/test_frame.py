@@ -20,6 +20,7 @@ from custom_components.lockly.api import (
     build_query_status_cmd,
     build_unlock_cmd,
     crc8_lockly,
+    dedupe_credentials,
     derive_aes_key,
     encrypt_master_code,
     host_password_from,
@@ -259,6 +260,28 @@ def test_rejection_is_not_parsed_as_data() -> None:
           parse_pwd_list_ack("A1B2C3D40A000C93FF98", MC, UUID), None)
 
 
+def test_credential_dedupe() -> None:
+    """A re-requested page must not double every credential.
+
+    Observed on real hardware: a lock holding 4 credentials reported 8, the
+    same four twice, because its page counters read as "there is more" when the
+    whole list had already arrived.
+    """
+    print("credential dedupe")
+    page = [
+        {"user_type": 2, "pwd_id": 0, "password": "980798"},
+        {"user_type": 3, "pwd_id": 1, "password": "111111"},
+        {"user_type": 3, "pwd_id": 4, "password": "222222"},
+        {"user_type": 3, "pwd_id": 29, "password": "333333"},
+    ]
+    merged = dedupe_credentials(page + page)
+    check("duplicated page collapses", len(merged), 4)
+    check("slots preserved in order", [e["pwd_id"] for e in merged], [0, 1, 4, 29])
+    check("host still resolvable", host_password_from(merged), "980798")
+    check("a genuinely distinct slot survives",
+          len(dedupe_credentials(page + [{"user_type": 3, "pwd_id": 9, "password": "9"}])), 5)
+
+
 def test_operator_resolution() -> None:
     """Resolving who triggered an access event from the credential slot.
 
@@ -303,6 +326,7 @@ def main() -> int:
         test_user_type_2_has_no_schedule,
         test_no_passwords_sentinel,
         test_rejection_is_not_parsed_as_data,
+        test_credential_dedupe,
         test_operator_resolution,
     ):
         test()

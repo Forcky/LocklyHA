@@ -307,6 +307,17 @@ class LocklyCoordinator(DataUpdateCoordinator):
         host_pwd = host_password_from(entries)
         self._host_passwords[lock_id] = host_pwd
         cloud_hc = str(lock.get("hc") or "")
+        # Per-entry shape, so a misaligned walk is visible rather than inferred:
+        # a wrong step yields implausible user_type or length values.  Lengths
+        # only — never the passwords themselves.
+        _LOGGER.debug(
+            "Lockly: lock %s credential entries (type/slot/len): %s",
+            lock.get("blename") or lock_id,
+            [
+                (e.get("user_type"), e.get("pwd_id"), len(e.get("password") or ""))
+                for e in entries
+            ],
+        )
         _LOGGER.warning(
             "Lockly: lock %s reports %d credential(s), slots %s; host slot 0 "
             "present=%s, matches cloud hc=%s",

@@ -849,12 +849,35 @@ async def api_query_passwords(
             )
             return None
 
-        entries.extend(page.get("entries") or [])
-        if page.get("is_end", True):
+        entries = dedupe_credentials(entries + (page.get("entries") or []))
+
+        # The lock states how many credentials it holds; stop once we have them
+        # all rather than trusting the page counters.
+        total = page.get("total") or 0
+        if page.get("is_end", True) or (total and len(entries) >= total):
             break
         position = int(page.get("cur_page", position)) + 1
 
     return entries
+
+
+def dedupe_credentials(entries: list[dict]) -> list[dict]:
+    """Keep the first entry per credential slot, preserving order.
+
+    A lock that returns its whole credential list in one response can still
+    report page counters that read as "there is more".  Following them
+    re-requests the same page, so the same credentials arrive twice.  The slot
+    is unique per credential, so it is the right key to collapse on.
+    """
+    seen: set = set()
+    unique: list[dict] = []
+    for entry in entries:
+        slot = entry.get("pwd_id")
+        if slot in seen:
+            continue
+        seen.add(slot)
+        unique.append(entry)
+    return unique
 
 
 def host_password_from(entries: list[dict]) -> str | None:
