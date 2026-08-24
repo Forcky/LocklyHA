@@ -43,7 +43,7 @@ class LocklyLock(CoordinatorEntity, LockEntity):
             identifiers={(DOMAIN, lock_id)},
             name=lock.get("na") or lock.get("blename") or lock_id,
             manufacturer="Lockly",
-            model=lock.get("lockType") or "Smart Lock",
+            model=lock.get("mod") or "Smart Lock",
         )
 
     @property

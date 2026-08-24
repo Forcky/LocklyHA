@@ -27,6 +27,12 @@ class LocklyMQTTManager:
         self._hass = hass
         self._coordinator = coordinator
         self._client: paho.Client | None = None
+        self._connected = False
+
+    @property
+    def connected(self) -> bool:
+        """True once the broker has accepted the connection."""
+        return self._connected
 
     async def async_start(self) -> None:
         jwt = self._coordinator.jwt
@@ -36,9 +42,13 @@ class LocklyMQTTManager:
 
         def on_connect(client, userdata, flags, rc):
             if rc == 0:
-                _LOGGER.info("Lockly MQTT connected")
+                self._connected = True
+                # Logged at info: without it there is no way to tell a working
+                # push connection from one that silently never connected.
+                _LOGGER.info("Lockly MQTT connected, subscribing to %r", _TOPIC)
                 client.subscribe(_TOPIC, qos=0)
             else:
+                self._connected = False
                 _LOGGER.warning(
                     "Lockly MQTT connection refused rc=%s — "
                     "real-time push disabled, polling continues",
@@ -46,8 +56,12 @@ class LocklyMQTTManager:
                 )
 
         def on_disconnect(client, userdata, rc):
+            self._connected = False
             if rc != 0:
                 _LOGGER.warning("Lockly MQTT disconnected unexpectedly rc=%s", rc)
+
+        def on_subscribe(client, userdata, mid, granted_qos, properties=None):
+            _LOGGER.info("Lockly MQTT subscription confirmed (qos=%s)", granted_qos)
 
         def on_message(client, userdata, msg):
             try:
@@ -66,23 +80,48 @@ class LocklyMQTTManager:
             except Exception:
                 _LOGGER.exception("Lockly MQTT message parse error")
 
-        cli = paho.Client(client_id=client_id, protocol=paho.MQTTv311)
-        cli.username_pw_set(email, jwt)
-        # Lockly's broker presents a self-signed chain; skip verification.
-        cli.tls_set(cert_reqs=ssl.CERT_NONE)
-        cli.tls_insecure_set(True)
-        cli.on_connect = on_connect
-        cli.on_disconnect = on_disconnect
-        cli.on_message = on_message
-        self._client = cli
-
         try:
+            # Client construction sits inside the try: on paho-mqtt 2.x the v1
+            # callback API must be requested explicitly, and an exception here
+            # would otherwise propagate out and fail the whole config entry.
+            try:
+                cli = paho.Client(
+                    callback_api_version=paho.CallbackAPIVersion.VERSION1,
+                    client_id=client_id,
+                    protocol=paho.MQTTv311,
+                )
+            except (AttributeError, TypeError):
+                cli = paho.Client(client_id=client_id, protocol=paho.MQTTv311)  # paho 1.x
+
+            cli.username_pw_set(email, jwt)
+            cli.on_connect = on_connect
+            cli.on_disconnect = on_disconnect
+            cli.on_subscribe = on_subscribe
+            cli.on_message = on_message
+            self._client = cli
+
+            # tls_set loads the CA store from disk — blocking I/O, so it must not
+            # run on the event loop.  Lockly's broker presents a self-signed
+            # chain, so verification is disabled.
+            await self._hass.async_add_executor_job(
+                lambda: cli.tls_set(cert_reqs=ssl.CERT_NONE)
+            )
+            await self._hass.async_add_executor_job(cli.tls_insecure_set, True)
             await self._hass.async_add_executor_job(
                 lambda: cli.connect(_BROKER, _PORT, keepalive=60)
             )
             await self._hass.async_add_executor_job(cli.loop_start)
         except Exception:
             _LOGGER.exception("Lockly MQTT failed to connect — polling-only mode")
+
+    async def async_reconnect(self) -> None:
+        """Restart the MQTT session using the coordinator's current JWT.
+
+        The broker password is the JWT, which the cloud rotates roughly every 24
+        hours.  Without reconnecting, push dies silently at the first rotation.
+        """
+        await self.async_stop()
+        await self.async_start()
 
     async def _process_device_state(self, data: dict) -> None:
         items = data.get("items") or []

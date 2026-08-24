@@ -5,3 +5,5 @@ __pycache__/
 APK/
 lockly_apk_analysis/
 null
+PowerShell 7.6.1/
+tests/__pycache__/
