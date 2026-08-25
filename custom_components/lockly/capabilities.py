@@ -43,6 +43,38 @@ LOG_RECORD_CHARS_LEGACY = 20
 # isSimpleAttendance(): PGI302FC / PGI303FC / PGI302W.
 _SIMPLE_ATTENDANCE = frozenset({51, 54, 67})
 
+# PagingLogCmd reads the log a page at a time, bounded by a date range, where
+# SyncUnlockRecord returns a large block in one go.  Log148Cmd sends 0x94,
+# Log124Cmd sends 0x7C.
+CMD_PAGING_LOG_148 = "94"
+CMD_PAGING_LOG_124 = "7C"
+
+# Log124Cmd.parseData record width: date(6B) type(1B) slot(4B LE) id(2B).
+PAGING_LOG_RECORD_CHARS = 26
+
+# "No bound" sentinels for the date range (PagingLogCmd.DATE_UNLIMITED and the
+# matching value for the time half).
+PAGING_DATE_UNLIMITED = "FFFFFF"
+PAGING_TIME_UNLIMITED = "FFFFFFFFFF"
+
+# isSupport148Cmd(), the unconditional members.  PGD628FN is absent, so it uses
+# the 0x7C form.
+_SUPPORTS_148_CMD = frozenset({
+    102,  # PGK7SWH
+    103,  # PGK7SWHK
+    104,  # PGK728WHK
+    105,  # PGK728WRHK
+    113,  # PGD899G
+    117,  # PGK798HK
+    124,  # PGD728FG25
+    125,  # PGD728FNG25
+    127,  # PGD628FG25
+    128,  # PGK728WKL
+    129,  # PGD728FN21
+    132,  # PGD7AWG25
+    133,  # PGD7YWG25
+})
+
 # QueryPwdCmd.NO_PASSWOED: the sentinel frame meaning "this lock holds none".
 _NO_PASSWORDS_ACK = "a1b2c3d40a000c11019a"
 
@@ -249,6 +281,16 @@ class LockCapabilities:
         if self.is_simple_attendance or self.supports_log_120:
             return LOG_RECORD_CHARS_WIDE
         return LOG_RECORD_CHARS_LEGACY
+
+    @property
+    def supports_148_cmd(self) -> bool:
+        """isSupport148Cmd(): the 0x94 form of the paged log query."""
+        return self.lock_type in _SUPPORTS_148_CMD
+
+    @property
+    def paging_log_cmd_code(self) -> str:
+        """BLE command for the paged, date-bounded access-log query."""
+        return CMD_PAGING_LOG_148 if self.supports_148_cmd else CMD_PAGING_LOG_124
 
     @property
     def needs_firmware_check(self) -> bool:

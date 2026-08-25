@@ -25,6 +25,7 @@ from .api import (
     api_login,
     api_query_lock_status,
     api_query_lock_log,
+    api_query_lock_log_paged,
     api_query_passwords,
     api_unlock,
     host_password_from,
@@ -120,6 +121,8 @@ class LocklyCoordinator(DataUpdateCoordinator):
         # Record ids already surfaced from a lock's own log, so re-reading it
         # does not re-fire events for activity we have already reported.
         self._seen_log_ids: dict[str, set] = {}
+        # Locks whose bulk log read has failed; these use the paged query only.
+        self._prefer_paged_log: set[str] = set()
         # MQTT push configuration from getHeartbeatTime.  The broker authorises
         # subscriptions by client identity, and client_id is the only one the
         # API exposes; None means we never got it and fall back to defaults.
@@ -448,13 +451,39 @@ class LocklyCoordinator(DataUpdateCoordinator):
         """
         lock_id = lock["ID"]
         nonce = self._nonces.get(lock_id)
-        records = await api_query_lock_log(
-            self._session, self.jwt, self.email, self.des3_key, lock,
-            nonce=nonce, caps=self._caps_for(lock),
-        )
+        caps = self._caps_for(lock)
+        cutoff = self._history_cutoff_ms()
+
+        if lock_id in self._prefer_paged_log:
+            records = None
+        else:
+            records = await api_query_lock_log(
+                self._session, self.jwt, self.email, self.des3_key, lock,
+                nonce=nonce, caps=caps,
+            )
+
         if records is None:
+            # The bulk read returns the whole log in one response, which some
+            # locks' BLE links cannot carry — it comes back as a hub timeout or
+            # a Bluetooth error.  The paged form asks for a bounded window
+            # instead, so the response is small enough to get through.
             _LOGGER.debug(
-                "Lockly lock log: %s read failed", lock.get("blename") or lock_id
+                "Lockly lock log: %s bulk read unavailable, trying the paged query",
+                lock.get("blename") or lock_id,
+            )
+            records = await api_query_lock_log_paged(
+                self._session, self.jwt, self.email, self.des3_key, lock,
+                start_ms=cutoff, end_ms=None, nonce=nonce, caps=caps,
+            )
+            if records:
+                # Stop paying for a bulk attempt that has already been shown to
+                # fail on this lock.
+                self._prefer_paged_log.add(lock_id)
+
+        if not records:
+            _LOGGER.debug(
+                "Lockly lock log: %s read failed (bulk and paged)",
+                lock.get("blename") or lock_id,
             )
             return
 

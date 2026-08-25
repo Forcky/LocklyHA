@@ -17,6 +17,7 @@ from Crypto.Cipher import AES
 
 from custom_components.lockly.api import (
     build_lock_cmd,
+    build_paging_log_cmd,
     build_query_pwd_cmd,
     build_query_status_cmd,
     build_unlock_cmd,
@@ -337,6 +338,39 @@ def test_log_padding_terminates() -> None:
     check("exactly one record", len(parsed) if parsed is not None else -1, 1)
 
 
+def test_paging_log_frame() -> None:
+    """The paged, date-bounded log query — used where the bulk read is too big."""
+    print("paged log frame (0x7C)")
+    caps = resolve_capabilities({"mod": "PGD628FN", "fwv": "4.03.15"}, lock_type=21)
+    check("PGD628FN uses 0x7C", caps.paging_log_cmd_code, "7C")
+    check("PGD628FG25 uses 0x94",
+          resolve_capabilities({"mod": "PGD628FG25"}, lock_type=127).paging_log_cmd_code, "94")
+
+    enc_mc = encrypt_master_code(MC, UUID)
+    unbounded = decrypt_frame(
+        build_paging_log_cmd(MC, UUID, 0, None, None, NONCE, caps), MC, UUID
+    )
+    expected = (
+        "7C08" + enc_mc
+        + "FFFFFF" + "FFFFFF"        # both date bounds unlimited
+        + "0000"                     # page index 0, little endian
+        + "FFFFFFFFFF" + "FFFFFFFFFF"  # both time bounds unlimited
+        + NONCE
+    )
+    check("unbounded request", unbounded[:len(expected)], expected)
+
+    # A real lower bound replaces the sentinel with a packed date and time.
+    start = int(datetime(2026, 8, 18, 9, 30).timestamp() * 1000)
+    bounded = decrypt_frame(
+        build_paging_log_cmd(MC, UUID, 3, start, None, NONCE, caps), MC, UUID
+    )
+    base = 4 + len(enc_mc)
+    check("start date packed", bounded[base:base + 6], "1A0812")      # 26-08-18
+    check("end date still unlimited", bounded[base + 6:base + 12], "FFFFFF")
+    check("page index is little endian", bounded[base + 12:base + 16], "0300")
+    check("start time packed", bounded[base + 16:base + 26], "1A0812091E")
+
+
 def test_credential_dedupe() -> None:
     """A re-requested page must not double every credential.
 
@@ -407,6 +441,7 @@ def main() -> int:
         test_log_record_parsing,
         test_log_no_credential_sentinel,
         test_log_padding_terminates,
+        test_paging_log_frame,
         test_credential_dedupe,
         test_operator_resolution,
     ):

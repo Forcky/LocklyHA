@@ -22,6 +22,9 @@ from .capabilities import (
     CMD_QUERY_STATUS,
     DEFAULT_CAPABILITIES,
     LOG_RECORD_CHARS_WIDE,
+    PAGING_DATE_UNLIMITED,
+    PAGING_LOG_RECORD_CHARS,
+    PAGING_TIME_UNLIMITED,
     UNLOCK_TYPE_HOST,
     LockCapabilities,
 )
@@ -1023,6 +1026,204 @@ async def api_query_lock_log(
     except Exception:
         _LOGGER.exception("query lock log failed for lock %s", lock.get("blename"))
         return None
+
+
+def _digits_to_packed_hex(digits: str) -> str:
+    """Encode a decimal digit string as one byte per pair (DataUtils.m86646a).
+
+    Each two decimal digits become the byte whose hex representation reads as
+    those digits — "26" becomes 0x1A.  This is the same encoding used for the
+    timestamp in a status query.
+    """
+    return "".join(f"{int(digits[i:i + 2]):02x}" for i in range(0, len(digits), 2))
+
+
+def _paging_bounds(epoch_ms: int | None) -> tuple[str, str]:
+    """Encode one end of the paged-log date range.
+
+    Returns (date, time) — 3 bytes of yyMMdd and 5 bytes of yyMMddHHmm.  A
+    non-positive bound becomes the "unlimited" sentinels, which is how the app
+    asks for an open-ended range.
+
+    The split into a 6-digit and a 10-digit field follows getNum6StringByLong /
+    getNum10StringByLong; the exact field meanings are inferred from their
+    lengths, so this is validated against a lock whose log we can already read
+    before being relied on.
+    """
+    if not epoch_ms or epoch_ms <= 0:
+        return PAGING_DATE_UNLIMITED, PAGING_TIME_UNLIMITED
+    stamp = datetime.fromtimestamp(epoch_ms / 1000)
+    return (
+        _digits_to_packed_hex(stamp.strftime("%y%m%d")),
+        _digits_to_packed_hex(stamp.strftime("%y%m%d%H%M")),
+    )
+
+
+def build_paging_log_cmd(
+    master_code: str,
+    uuid: str,
+    index: int = 0,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    nonce: str | None = None,
+    caps: LockCapabilities | None = None,
+) -> str:
+    """Build a PagingLogCmd frame — the paged, date-bounded access-log query.
+
+    Where SyncUnlockRecord returns the whole log in one large response, this
+    asks for a bounded window one page at a time, which is what makes it usable
+    on locks whose BLE link cannot carry the bulk transfer.
+
+    Layout (PagingLogCmd.getData):
+
+        cmd | mc_len | enc_mc | start_date | end_date | index | start_time |
+        end_time | nonce
+    """
+    caps = caps or DEFAULT_CAPABILITIES
+    enc_mc = encrypt_master_code(master_code, uuid)
+    start_date, start_time = _paging_bounds(start_ms)
+    end_date, end_time = _paging_bounds(end_ms)
+    raw = _assemble_fields(
+        caps.paging_log_cmd_code,
+        f"{len(enc_mc) // 2:d}",
+        enc_mc,
+        start_date,
+        end_date,
+        f"{index & 0xFF:02x}{(index >> 8) & 0xFF:02x}",  # 2-byte little endian
+        start_time,
+        end_time,
+        (nonce or "").upper(),
+    )
+    return _aes_wrap(raw, derive_aes_key(master_code, uuid))
+
+
+def parse_paging_log_ack(
+    ack_hex: str,
+    master_code: str,
+    uuid: str,
+) -> dict[str, Any] | None:
+    """Parse a PagingLogCmd response.
+
+    Header is total, current and the record count in this page, each a 2-byte
+    little-endian value, followed by fixed-width records:
+
+        date(6B) | open_type(1B) | slot(4B LE) | record_id(2B LE)
+    """
+    h = ack_hex.upper()
+    try:
+        payload = bytes.fromhex(h[16:-2])
+        if len(payload) == 0 or len(payload) % 16 != 0:
+            code = h[16:18]
+            _LOGGER.debug(
+                "paged log rejected: %s — %s", code, describe_ble_error(code)
+            )
+            return None
+        d = AES.new(derive_aes_key(master_code, uuid), AES.MODE_ECB).decrypt(payload).hex().upper()
+        if len(d) < 12:
+            return None
+
+        def le16(chunk: str) -> int:
+            return int(chunk[0:2], 16) + int(chunk[2:4], 16) * 256
+
+        total = le16(d[0:4])
+        current = le16(d[4:8])
+        count = le16(d[8:12])
+
+        body = d[12:]
+        records: list[dict] = []
+        for i in range(count):
+            start = i * PAGING_LOG_RECORD_CHARS
+            rec = body[start:start + PAGING_LOG_RECORD_CHARS]
+            if len(rec) < PAGING_LOG_RECORD_CHARS:
+                break
+            timestamp = _decode_packed_datetime(rec[0:12])
+            if timestamp is None:
+                break
+            slot = sum(int(rec[14 + n * 2:16 + n * 2], 16) << (8 * n) for n in range(4))
+            records.append({
+                "tm": timestamp,
+                "co": str(int(rec[12:14], 16)),
+                "pid": None if slot in (0xFF, 0xFFFF, 0xFFFFFFFF) else slot,
+                "id": le16(rec[22:26]),
+                "na": "",
+            })
+        return {
+            "records": records,
+            "total": total,
+            "current": current,
+            "is_end": current >= total,
+        }
+    except Exception:
+        _LOGGER.exception("Failed to parse paged log ACK: %s", ack_hex[:60])
+        return None
+
+
+async def api_query_lock_log_paged(
+    session: aiohttp.ClientSession,
+    jwt: str,
+    email: str,
+    des3_key: bytes,
+    lock: dict,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    nonce: str | None = None,
+    caps: LockCapabilities | None = None,
+    max_pages: int = 8,
+) -> list[dict] | None:
+    """Read the access log a page at a time, bounded by a date range.
+
+    Preferred over the bulk read on locks whose BLE link cannot carry a large
+    response — the bulk form returns the whole log at once and times out, where
+    a bounded page is small enough to get through.
+    """
+    mc = str(lock["mc"])
+    uuid = lock["ID"]
+    records: list[dict] = []
+    index = 0
+
+    for _ in range(max_pages):
+        cmd_hex = build_paging_log_cmd(mc, uuid, index, start_ms, end_ms, nonce, caps)
+        req = {
+            "acct": email,
+            "hubid": lock.get("hubid", ""),
+            "dv": uuid,
+            "cmd": cmd_hex,
+            "mdna": lock.get("iotdm", ""),
+        }
+        para = des3_encrypt(des3_key, json.dumps(req, separators=(",", ":")))
+        try:
+            async with session.post(
+                API_BASE + "senddata",
+                json={**COMMON_BODY, "para": para},
+                headers=_headers(jwt),
+                timeout=aiohttp.ClientTimeout(total=SENDDATA_TIMEOUT),
+            ) as resp:
+                body = await resp.json(content_type=None)
+                cod = str(body.get("cod"))
+                if cod != "200" or "ACK" not in body:
+                    _LOGGER.debug(
+                        "paged log failed: cod=%s lock=%s page=%d (%s)",
+                        cod, lock.get("blename"), index, describe_cod(cod),
+                    )
+                    return records or None
+                page = parse_paging_log_ack(body["ACK"], mc, uuid)
+                if page is None:
+                    return records or None
+        except Exception:
+            _LOGGER.exception("paged log request failed for %s", lock.get("blename"))
+            return records or None
+
+        records.extend(page["records"])
+        _LOGGER.debug(
+            "Lockly paged log: %s page %d — %d record(s), %d/%d",
+            lock.get("blename") or uuid, index,
+            len(page["records"]), page["current"], page["total"],
+        )
+        if page["is_end"] or not page["records"]:
+            break
+        index += 1
+
+    return records
 
 
 def dedupe_credentials(entries: list[dict]) -> list[dict]:
