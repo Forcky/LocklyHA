@@ -127,6 +127,9 @@ class LocklyCoordinator(DataUpdateCoordinator):
         # Locks whose access log has been read this session.  Reading it wakes
         # the lock, so it is done once and then only on request.
         self._lock_log_read: set[str] = set()
+        # Locks observed reporting a CLOSED door circuit, which only a fitted
+        # sensor can produce.  Used to gate the door sensor entity.
+        self._door_sensor_proven: set[str] = set()
         # MQTT push configuration from getHeartbeatTime.  The broker authorises
         # subscriptions by client identity, and client_id is the only one the
         # API exposes; None means we never got it and fall back to defaults.
@@ -215,6 +218,19 @@ class LocklyCoordinator(DataUpdateCoordinator):
                         "to the 0x22 frame. Please report this on GitHub.",
                         lock.get("blename") or lock_id, caps.lock_type,
                     )
+        # A door-circuit reading of "closed" can only come from a fitted sensor —
+        # an unfitted one is an open circuit and always reads open.  So observing
+        # closed once proves a sensor exists, and from then on an "open" reading
+        # for that lock means the door, not a missing sensor.  Locks that never
+        # read closed are left unproven, which is the honest answer: their
+        # constant "open" is indistinguishable from having no sensor at all.
+        if status.get("door_sensor_open") is False and lock_id not in self._door_sensor_proven:
+            self._door_sensor_proven.add(lock_id)
+            _LOGGER.info(
+                "Lockly: %s has a working door sensor (reported a closed door)",
+                lock.get("na") or lock.get("blename") or lock_id,
+            )
+
         nonce = status.get("ble_nonce")
         if nonce:
             self._nonces[lock_id] = nonce
@@ -252,7 +268,14 @@ class LocklyCoordinator(DataUpdateCoordinator):
 
             if status:
                 self._learn_from_status(lock, status)
-                result[lock_id] = {**lock, **status}
+                result[lock_id] = {
+                    **lock,
+                    **status,
+                    # Only meaningful once a closed reading has proven a sensor
+                    # exists; before that an "open" circuit is indistinguishable
+                    # from no sensor being fitted.
+                    "wired_door_sensor_connected": lock_id in self._door_sensor_proven,
+                }
                 any_ok = True
             elif self.data and lock_id in self.data:
                 result[lock_id] = self.data[lock_id]

@@ -474,18 +474,19 @@ def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
             "firmware_version": d[0:8],
             "is_locked": not bool((status_byte >> 1) & 1),
             "battery_invalid": bool((status_byte >> 4) & 1),
-            # Bit 0 is inverted relative to what the protocol notes claimed: it
-            # is SET when the lock has NO wired door sensor.  Captured from four
-            # locks whose fitment is known to the owner — the two with a sensor
-            # report 0x00, the two without report 0x01 — so this is 4/4 rather
-            # than inference from the docs.
-            "wired_door_sensor_connected": not bool(status_byte & 1),
-            # Polarity of the open/closed bit is NOT confirmed.  Every lock read
-            # so far had its door shut and reported 0 here, which is consistent
-            # with 0 = closed but does not prove it; nothing has yet been seen
-            # with a door open.  Treat a reported "open" with suspicion until a
-            # door has been opened and re-read.
-            "door_sensor_open": bool((status_byte >> 2) & 1),
+            # Bit 0 is the door circuit, confirmed by watching it change: a
+            # sensor-equipped lock read 0 with its door shut and 1 with the same
+            # door open.  A closed door completes the circuit, an open door
+            # breaks it, and a lock with no sensor fitted is an open circuit
+            # permanently — which is why every sensorless lock here reads 1.
+            #
+            # That single meaning explains all five observations, and it means
+            # sensor PRESENCE cannot be read from this byte: "1" is ambiguous
+            # between "door open" and "no sensor".  Two earlier readings of this
+            # bit — as sensor-connected, then as its inverse — were both wrong,
+            # each fitted to samples that happened to have every sensor-equipped
+            # door shut.
+            "door_sensor_open": bool(status_byte & 1),
         }
         if len(d) >= 14:
             result["wakeup_voltage"] = int(d[10:12], 16) + int(d[12:14], 16) * 256
