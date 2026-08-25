@@ -740,9 +740,14 @@ _BLE_ERRORS = {
 
 # Access-log event types.  The app resolves these through a two-stage string
 # switch — the code maps to an index, and the index maps to a label hundreds of
-# lines away — so only entries where both halves could be read directly are
-# listed here.  Codes outside this set are reported as their raw number rather
-# than guessed at; several sit behind constants that could not be resolved.
+# lines away — so the code and its meaning are never adjacent in the source.
+#
+# This table is as complete as the app itself.  The label switch stops at index
+# 31, and higher codes (42 and up, which these locks emit often) map to indices
+# beyond that and fall through to a default branch which renders them
+# generically.  So there is no per-code label to recover for them: the app does
+# not distinguish them either, and reporting the raw number is more honest than
+# inventing a name.
 #
 # Note this identifies *how* the lock was opened, not which credential type was
 # used: fingerprint and RFID are distinguished via separate sensor lists that
