@@ -461,12 +461,30 @@ def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
             return {}
 
         status_byte = int(d[8:10], 16)
+        # Every bit, labelled, so the assignment can be checked against known
+        # hardware instead of trusted.  bit0 is the least significant.
+        _LOGGER.debug(
+            "status byte 0x%02X = %s  (bit0=%d bit1=%d bit2=%d bit3=%d "
+            "bit4=%d bit5=%d bit6=%d bit7=%d)",
+            status_byte, format(status_byte, "08b"),
+            *[(status_byte >> n) & 1 for n in range(8)],
+        )
         result: dict[str, Any] = {
+            "status_byte": status_byte,
             "firmware_version": d[0:8],
             "is_locked": not bool((status_byte >> 1) & 1),
-            "door_sensor_open": bool((status_byte >> 2) & 1),
-            "wired_door_sensor_connected": bool(status_byte & 1),
             "battery_invalid": bool((status_byte >> 4) & 1),
+            # Door sensor flags are deliberately NOT derived from this byte.
+            # Captured from four locks whose sensor fitment is known: the two
+            # WITH a wired sensor report 0x00, and the two without report 0x01.
+            # So bit 0 — which this previously reported as "wired sensor
+            # connected" — is set exactly on the locks that have no sensor, and
+            # no bit is set on the ones that do.  Whatever bit 0 means, it is
+            # not sensor presence, and a positive "sensor fitted" flag is not in
+            # this byte.  Reporting a fabricated "door closed" for a lock with
+            # no sensor is worse than reporting nothing, so the door sensor now
+            # relies solely on lock/cachedstatus/get, whose sts bitmap has
+            # documented HAS_WIRED_DS / HAS_RF_DS bits (§14).
         }
         if len(d) >= 14:
             result["wakeup_voltage"] = int(d[10:12], 16) + int(d[12:14], 16) * 256
@@ -714,6 +732,19 @@ async def api_query_lock_status(
                 )
                 return None
             parsed = parse_ack(body["ACK"], mc, uuid)
+            if parsed:
+                # Named so the bit assignment can be checked per lock against
+                # hardware that is known to have or not have a door sensor.
+                _LOGGER.debug(
+                    "status: lock=%s status_byte=0x%02X (%s) wired_ds=%s "
+                    "ds_open=%s locked=%s",
+                    lock.get("blename") or uuid,
+                    parsed.get("status_byte", 0),
+                    format(parsed.get("status_byte", 0), "08b"),
+                    parsed.get("wired_door_sensor_connected"),
+                    parsed.get("door_sensor_open"),
+                    parsed.get("is_locked"),
+                )
             if parsed and "battery_invalid" in parsed:
                 parsed.setdefault("low_battery", parsed["battery_invalid"])
             return parsed
