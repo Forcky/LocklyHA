@@ -37,6 +37,13 @@ HISTORY_LOOKBACK_DAYS = 7
 HISTORY_INITIAL_DELAY_SECONDS = 30
 SENDDATA_TIMEOUT = 30
 
+# Attempts at the one-off live status query used to seed state when the hub's
+# cachedstatus endpoint is unavailable.  A single attempt is not enough: a
+# transient NACK or hub relay timeout cost the lock its state for the whole
+# session.  The cap is what keeps retries from becoming a poll loop, since
+# every attempt wakes the lock and some models beep when woken.
+LIVE_INIT_MAX_ATTEMPTS = 3
+
 SERVICE_LIST_GUESTS  = "list_guests"
 SERVICE_ADD_GUEST    = "add_guest"
 SERVICE_DELETE_GUEST = "delete_guest"

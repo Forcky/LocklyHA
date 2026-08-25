@@ -23,6 +23,7 @@ from custom_components.lockly.api import (
     build_unlock_cmd,
     crc8_lockly,
     dedupe_credentials,
+    describe_ble_error,
     describe_open_type,
     derive_aes_key,
     encrypt_master_code,
@@ -264,6 +265,27 @@ def test_rejection_is_not_parsed_as_data() -> None:
           parse_pwd_list_ack("A1B2C3D40A000C93FF98", MC, UUID), None)
 
 
+def test_status_nack_is_not_data() -> None:
+    """A bare error byte from the lock is a failure, not a status frame.
+
+    This is the path that once hid a lock sitting stateless for hours: the
+    misaligned payload was reported as a byte count at DEBUG, so nothing
+    upstream could tell a refused query from a lost one.
+    """
+    print("status NACK handling")
+    # 1-byte AES payload — the lock answered with an error code, not a status
+    # block.  Anything but {} here would be a status dict built from garbage.
+    check("NACK returns empty", parse_ack("A1B2C3D40A000C1EFF98", MC, UUID), {})
+    check("a real status frame still parses",
+          bool(parse_ack("A1B2C3D429000A1E95A9B99DCBC5945E531B5EB4A643BA93BE5696D79B9791D9"
+                         "392AC7509E8BB800A2", MC, UUID)), True)
+    check("error byte is named",
+          describe_ble_error("FF"),
+          "wrong password — the lock rejected the credential in the command")
+    check("unknown error still described",
+          describe_ble_error("A7"), "unknown lock error")
+
+
 def test_log_command_selection() -> None:
     """Which access-log command a lock uses, and its record width."""
     print("access log command selection")
@@ -451,6 +473,7 @@ def main() -> int:
         test_user_type_2_has_no_schedule,
         test_no_passwords_sentinel,
         test_rejection_is_not_parsed_as_data,
+        test_status_nack_is_not_data,
         test_log_command_selection,
         test_log_record_parsing,
         test_log_no_credential_sentinel,

@@ -448,8 +448,16 @@ def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
     try:
         payload = bytes.fromhex(payload_hex)
         if len(payload) % 16 != 0:
-            # Short/misaligned payload means the lock sent an error/nack frame.
-            _LOGGER.debug("ACK payload not AES-aligned (%d bytes) — lock returned error/nack", len(payload))
+            # A misaligned payload is not a truncated status frame — it is the
+            # lock answering with a bare error byte instead.  Name the error and
+            # log it loudly: this is the only signal that a status query was
+            # refused rather than lost, and reporting it as a byte count at
+            # DEBUG once hid a lock sitting stateless for hours.
+            err = h[16:18]
+            _LOGGER.warning(
+                "Lock returned error 0x%s instead of status: %s",
+                err, describe_ble_error(err),
+            )
             return {}
         # Keep the full decrypted hex: trailing 0x00 bytes are meaningful padding
         # for the fixed field offsets below, and stripping them truncates the

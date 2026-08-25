@@ -40,6 +40,7 @@ from .const import (
     HISTORY_INITIAL_DELAY_SECONDS,
     HISTORY_INTERVAL_SECONDS,
     HISTORY_LOOKBACK_DAYS,
+    LIVE_INIT_MAX_ATTEMPTS,
     SCAN_INTERVAL_SECONDS,
     SERVICE_ADD_GUEST,
     SERVICE_DELETE_GUEST,
@@ -103,8 +104,9 @@ class LocklyCoordinator(DataUpdateCoordinator):
         self._session: aiohttp.ClientSession | None = None
         # True until we confirm cached-status is unsupported for this hub.
         self._cache_supported: bool = True
-        # Lock IDs that still need a one-time live query for their initial state.
-        self._pending_live_init: set[str] = set()
+        # Lock ID -> live-status attempts so far.  Present means still trying;
+        # removed means either seeded successfully or given up on.
+        self._live_init_attempts: dict[str, int] = {}
         # Access log polling state.
         self._history_cursors: dict[str, int] = {}  # lock_id -> LAST_EVENT_SYNC_TIME ms
         self._history_cancel: list = []
@@ -172,7 +174,7 @@ class LocklyCoordinator(DataUpdateCoordinator):
         if mqtt is not None:
             await mqtt.async_reconnect()
         self._cache_supported = True
-        self._pending_live_init = {lock["ID"] for lock in self.locks}
+        self._live_init_attempts = {lock["ID"]: 0 for lock in self.locks}
         _LOGGER.info("Lockly: authenticated, found %d lock(s)", len(self.locks))
         for lock in self.locks:
             name = lock.get("na") or lock.get("blename") or lock["ID"]
@@ -182,12 +184,20 @@ class LocklyCoordinator(DataUpdateCoordinator):
                     "Lockly: lock %s is missing %s — commands will fail without it",
                     name, ", ".join(missing),
                 )
-            # Model/firmware only; mc, hc and iotsecret are credentials and must
-            # never reach the log.
+            # Model/firmware/topology only; mc, hc, iotsecret and iotprodkey are
+            # credentials and must never reach the log.  clientId and iotdm are
+            # reported as present/absent rather than by value: whether they are
+            # populated is the diagnostic, and the values are device identities.
             _LOGGER.debug(
-                "Lockly lock %s: model=%s fw=%s hub=%s hubver=%s caps=%s",
+                "Lockly lock %s: model=%s fw=%s hub=%s hubver=%s gw=%s/%s "
+                "dutype=%s ekey=%s otlk=%s subadm=%s/%s iotdm=%s clientId=%s caps=%s",
                 name, lock.get("mod"), lock.get("fwv"),
                 lock.get("hubid") or "(none)", lock.get("hubver"),
+                lock.get("gwModel"), lock.get("gwver"),
+                lock.get("dutype"), lock.get("ekeyType") or "(empty)",
+                lock.get("otlkmod"), lock.get("subadm"), lock.get("secondAdm"),
+                "set" if lock.get("iotdm") else "empty",
+                "set" if lock.get("clientId") else "empty",
                 self._caps_for(lock),
             )
 
@@ -256,15 +266,30 @@ class LocklyCoordinator(DataUpdateCoordinator):
                 if status is None:
                     cache_failed_count += 1
 
-            # One-time live query for initial state when cache is unavailable.
-            # Discard from the pending set unconditionally so a failed query is
-            # not retried on the next poll (which would cause repeated BLE sends
-            # and beeping on hubs where cachedstatus is unsupported).
-            if status is None and lock_id in self._pending_live_init:
-                self._pending_live_init.discard(lock_id)
+            # Live query to seed initial state when the cache is unavailable.
+            # Bounded retries, one per poll cycle: discarding after a single
+            # attempt meant a transient NACK or hub relay timeout cost the lock
+            # its state — and its door sensor entity — until HA restarted. The
+            # cap is what stops this being a poll loop, because every attempt
+            # wakes the lock and some models beep when woken.
+            attempts = self._live_init_attempts.get(lock_id)
+            if status is None and attempts is not None:
+                attempts += 1
+                self._live_init_attempts[lock_id] = attempts
                 status = await api_query_lock_status(
                     self._session, self.jwt, self.email, self.des3_key, lock
                 )
+                if status:
+                    del self._live_init_attempts[lock_id]
+                elif attempts >= LIVE_INIT_MAX_ATTEMPTS:
+                    del self._live_init_attempts[lock_id]
+                    _LOGGER.warning(
+                        "Lockly: %s returned no status in %d attempts — its "
+                        "state and door sensor stay unavailable until a command "
+                        "is sent to it or HA restarts",
+                        lock.get("na") or lock.get("blename") or lock_id,
+                        LIVE_INIT_MAX_ATTEMPTS,
+                    )
 
             if status:
                 self._learn_from_status(lock, status)
