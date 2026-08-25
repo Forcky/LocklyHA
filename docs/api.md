@@ -444,12 +444,27 @@ All offsets are character positions in the hex string (2 chars = 1 byte):
 
 **Status byte bits** (`d[8:10]`):
 
-| Bit | Mask | Name | Meaning when set |
-|---|---|---|---|
-| 0 | `0x01` | wired_door_sensor | Wired door sensor connected |
-| 1 | `0x02` | is_unlocked | Lock is **open** (unlocked) |
-| 2 | `0x04` | door_sensor_open | Door sensor reports door open |
-| 4 | `0x10` | battery_invalid | Voltage reading not valid |
+| Bit | Mask | Name | Meaning when set | Confidence |
+|---|---|---|---|---|
+| 0 | `0x01` | door_circuit_open | Door circuit is open — the door is ajar, **or** no sensor is fitted | verified |
+| 1 | `0x02` | is_unlocked | Lock is **open** (unlocked) | verified |
+| 2 | `0x04` | *unknown* | Previously documented here as the door state. Read `0` in all six samples captured so far — but none of those paired it with a sensor-equipped door known to be open, so its meaning is genuinely untested, not disproven | unverified |
+| 4 | `0x10` | battery_invalid | Voltage reading not valid | inferred from source |
+
+Bit 0 was verified by physically opening a sensor-equipped door and watching it
+change; a closed door completes the circuit and reads `0`. Note the consequence:
+this byte carries **no sensor-presence flag**. An unfitted sensor is an open
+circuit, so it reads `1` exactly like an open door, and the two cannot be
+distinguished from a single sample. Only a `0` is unambiguous — it proves a
+sensor exists. `parse_ack()` therefore reports the circuit state alone, and
+`LocklyCoordinator` infers presence by remembering which locks have ever
+reported closed.
+
+Do not re-derive bit 0 as "sensor connected". That reading, and its inverse,
+were both implemented and both wrong; each matched every sample then available
+because those samples all happened to have the sensor-equipped doors shut. The
+hub's `cachedstatus` `sts` integer (§14) uses a *different* layout that does
+have presence flags — do not carry its bit meanings over to this byte.
 
 ```python
 status_byte   = int(d[8:10], 16)

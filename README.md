@@ -20,7 +20,7 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 | Lock from HA | 🚧 Implemented; hard to verify on auto-locking locks |
 | Lock state (locked / unlocked) | ✅ At startup and after HA commands |
 | Battery low warning | ✅ |
-| Door sensor state (if fitted) | ❌ Availability looks inverted — see Known Limitations |
+| Door sensor state (if fitted) | ✅ Verified open and closed on a wired sensor |
 | Last access / who entered | ✅ Read from the lock; names resolve unless a slot is shared |
 | Guest PIN management (add / remove / list) | 🚧 In progress |
 | Real-time MQTT push (no-poll state updates) | ⛔ Roadblock — no viable path found, see Known Limitations |
@@ -115,7 +115,7 @@ Each lock creates four entities:
 - **State**: `locked` or `unlocked`
 - **Services**: `lock.lock`, `lock.unlock`
 - **Attributes**:
-  - `door_sensor_open` — state of the magnetic door sensor, if the lock has one fitted
+  - `door_sensor_open` — door circuit state, if a sensor is fitted. `true` also occurs on locks with no sensor; see [Door sensor](#door-sensor)
   - `firmware_version` — lock firmware string (available from live query)
   - `auto_unlock_delay_s` — configured auto-lock delay in seconds (available from live query)
 
@@ -127,6 +127,25 @@ Each lock creates four entities:
   - `low_battery` — raw boolean from the cloud or live query
 
 > **Battery percentage note:** The Lockly cloud cache only exposes a binary low/normal flag, not a precise voltage. The 10 % / 90 % values are representative sentinels, not real measurements.
+
+### Door sensor
+
+- **State**: `open` or `closed`
+- **Device class**: `door`
+- **Availability**: `unavailable` until the lock has reported a **closed** door at
+  least once
+
+The availability rule is not arbitrary. The lock reports a door *circuit*, not a
+door sensor: a shut door completes the circuit, an open door breaks it — and a
+lock with no sensor fitted is a broken circuit permanently. So "open" is
+ambiguous between a genuinely open door and no sensor at all, while "closed" can
+only come from a real sensor. The entity therefore appears the first time a lock
+reports closed, and stays available from then on.
+
+In practice it appears on the first poll for any lock whose door is shut. If it
+stays `unavailable`, shut the door and trigger a refresh — restart HA, or send
+any lock command. The learned state is held in memory, so it is re-learned after
+each restart. See [Known Limitations](#known-limitations).
 
 ---
 
@@ -196,7 +215,11 @@ Credentials (email and password) are stored in HA's config entry. The integratio
 
   What remains unknown is how a client obtains the real `user_client_id` the app stores (`user_client_id_1208`), which appears to come from a device-registration step that has not been located. Without that, further attempts mean guessing at an authentication flow while sending authenticated traffic at Lockly's broker — and a previous reconnect loop showed that has consequences. See [`docs/api.md`](docs/api.md) §17.
 
-- **Door sensor availability appears inverted.** The entity is implemented, but on the hardware tested the two locks that physically have a sensor report `unavailable`, while the two without one report a closed door. The likely cause is the status byte's bit assignment: this integration reads "wired sensor connected" from bit 0, but the app reads these flags out of a binary-expanded string where the sensor-present flag is bit 3 and bit 0 is the door's open/closed state. Not yet corrected, because it should be verified against a captured status byte rather than swapped on inference.
+- **Door sensor state is verified, but sensor _presence_ cannot be read from the lock.** Bit 0 of the status byte is the door circuit: `0` = closed, `1` = open. A closed door completes the circuit and an open door breaks it — but a lock with no sensor fitted is an open circuit permanently, so it reads `1` too. That makes `1` ambiguous between "door open" and "no sensor fitted", and this ACK carries no separate presence flag. (The hub's `lock/cachedstatus/get` response does have one, at bit 1, but that endpoint needs newer hub firmware — see above.)
+
+  The integration resolves the ambiguity by observation instead. A `0` can only come from a real sensor, so the first time a lock reports a closed door its `Door` entity becomes available and stays available. A lock that has never reported closed keeps the entity `unavailable` — the honest answer, rather than showing a permanently-open door that may not exist. In practice the entity appears on the first poll for any lock whose door is shut. If it stays `unavailable`, shut the door and trigger a refresh (restart HA, or send any lock command). One closed reading is enough, though it is held in memory only and re-learned after each restart.
+
+  Confirmed by physically opening a sensor-equipped door and watching the bit flip. Two earlier readings of this bit were wrong — first as "sensor connected", then as its inverse — and each fitted every sample available at the time, because those samples all happened to have the sensor-equipped doors shut. Four locks agreeing is not evidence when all four share a confound.
 - **Battery percentage is approximate** (binary low/normal flag only).
 - **Guest PIN activation is unverified**: `lockly.add_guest` creates the guest record on the Lockly cloud. Whether the PIN is automatically pushed to the lock hardware is not yet confirmed. If the PIN does not work physically, open an issue.
 - **`lock.lock` is implemented but unverified.** It differs from unlock by a single byte, and the app confirms these locks support an explicit lock command (`isSupportNewLock` covers PGD628FN). It is genuinely hard to observe on a lock with `autoLock` set, since the bolt throws itself within seconds either way. Please report whether it works on your model.
