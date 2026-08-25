@@ -20,10 +20,10 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 | Lock from HA | 🚧 Implemented; hard to verify on auto-locking locks |
 | Lock state (locked / unlocked) | ✅ At startup and after HA commands |
 | Battery low warning | ✅ |
-| Door sensor state (if fitted) | 🚧 In progress |
-| Last access / who entered | 🚧 In progress |
+| Door sensor state (if fitted) | ❌ Availability looks inverted — see Known Limitations |
+| Last access / who entered | ✅ Read from the lock; names resolve unless a slot is shared |
 | Guest PIN management (add / remove / list) | 🚧 In progress |
-| Real-time MQTT push (no-poll state updates) | ❌ Broker needs client-certificate auth — see Known Limitations |
+| Real-time MQTT push (no-poll state updates) | ⛔ Roadblock — no viable path found, see Known Limitations |
 | Multiple locks per account | ✅ |
 | Silent polling — lock does not beep during polls | ⚠️ Needs hub firmware ≥ build 422 |
 | Config flow UI | ✅ |
@@ -184,7 +184,19 @@ Credentials (email and password) are stored in HA's config entry. The integratio
 - **Locks with no PGH hub are not supported.** This covers both Bluetooth-only locks and WiFi-native models such as the `PGD728FG25`, which connect straight to WiFi. The `senddata` endpoint relays commands through a hub, so with an empty `hubid` the cloud returns `cod=930` for both state and commands. The integration now detects this and says so rather than reporting a bare error code. Supporting these locks needs a different API path (tracked in issue #2).
 - **Unlock is verified from 0.5.0.** Two fields in the command frame were wrong: the `str3` hub flag was sent as `00` instead of `01`, and the credential slot was sent as `1` instead of `0` (the host credential lives in slot 0). Both had to be right at once, which is why this took so long to find. Confirmed against physical hardware — a PGD628FN on firmware 4.03.15 behind a PGH220 hub.
 - **Silent polling requires hub firmware build ≥ 422** (for major-version-2 hubs). On older firmware `lock/cachedstatus/get` returns `cod=900` and state only updates at startup and after HA commands. Note that Lockly does not necessarily offer an upgrade: a PGH220 on `2.2.04.17` (build 417) reports itself up to date, five builds short of the requirement.
-- **Real-time MQTT push does not work yet.** The broker requires **client-certificate authentication**: `MqttSSLSocketFactory` in the app loads a CA, a client certificate and a client private key into a `KeyManagerFactory` over TLSv1.2. Connecting without a client certificate is refused (`rc=5`), or accepted and then denied at subscribe time (SUBACK `0x80`). Until this is implemented, state falls back to polling. See [`docs/api.md`](docs/api.md) §17, which also notes a possible HTTP alternative (`v1/proto/handler`).
+- **Real-time push: roadblock.** This is not "in progress" — every avenue found so far is closed, and no further work is planned without new information. State therefore updates at startup and after commands from HA. What was tried:
+
+  | Attempt | Result |
+  |---|---|
+  | Broker with email username + JWT password | CONNECT accepted, subscription to `server` refused (SUBACK `0x80`) |
+  | Adding the app's client certificate (mTLS) | No change — client identity was not the blocker |
+  | `getHeartbeatTime` for a server-assigned client id | The returned `clientId` is an echo of the `deviceId` we send, so `{clientId}_{email}` is meaningless |
+  | The broker address the API reports | Different host from the hardcoded one, and it refuses CONNECT outright (`rc=5`) |
+  | `POST v1/proto/handler` over HTTP | Gated behind `isSupportWiFiLowEnergy()`, which excludes `PGD628FN`; and it is request/response, so it could not deliver push regardless — `DeviceStateController` subscribes via Paho, so push is broker-only |
+
+  What remains unknown is how a client obtains the real `user_client_id` the app stores (`user_client_id_1208`), which appears to come from a device-registration step that has not been located. Without that, further attempts mean guessing at an authentication flow while sending authenticated traffic at Lockly's broker — and a previous reconnect loop showed that has consequences. See [`docs/api.md`](docs/api.md) §17.
+
+- **Door sensor availability appears inverted.** The entity is implemented, but on the hardware tested the two locks that physically have a sensor report `unavailable`, while the two without one report a closed door. The likely cause is the status byte's bit assignment: this integration reads "wired sensor connected" from bit 0, but the app reads these flags out of a binary-expanded string where the sensor-present flag is bit 3 and bit 0 is the door's open/closed state. Not yet corrected, because it should be verified against a captured status byte rather than swapped on inference.
 - **Battery percentage is approximate** (binary low/normal flag only).
 - **Guest PIN activation is unverified**: `lockly.add_guest` creates the guest record on the Lockly cloud. Whether the PIN is automatically pushed to the lock hardware is not yet confirmed. If the PIN does not work physically, open an issue.
 - **`lock.lock` is implemented but unverified.** It differs from unlock by a single byte, and the app confirms these locks support an explicit lock command (`isSupportNewLock` covers PGD628FN). It is genuinely hard to observe on a lock with `autoLock` set, since the bolt throws itself within seconds either way. Please report whether it works on your model.

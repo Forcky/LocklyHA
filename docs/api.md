@@ -909,20 +909,56 @@ identified by `header.name` in the JSON payload.
 > return code (`on_subscribe`'s `granted_qos`) — a value of 128 means refused,
 > not "subscribed at QoS 128".
 
-### HTTP alternative — `v1/proto/handler`
+### Roadblock: no viable push path found
 
-The app can carry the same protocol over plain HTTP:
+Real-time push is **blocked**, not merely unimplemented. Every avenue located so
+far is closed, and the notes below exist so nobody repeats the work.
+
+| Attempt | Result |
+|---|---|
+| `username = email`, `password = <jwt>` | CONNECT accepted (rc=0), subscription refused (SUBACK `0x80`) |
+| Add the app's client certificate (mTLS, see above) | No change — client identity was not the blocker |
+| `getHeartbeatTime` for a server-assigned client id | The returned `clientId` is an echo of the `deviceId` in the request, so `{clientId}_{email}` carries no new information |
+| The broker address `getHeartbeatTime` reports | A different host from `PgConfig`'s, and it refuses CONNECT outright (`rc=5`) |
+| `POST v1/proto/handler` | Request/response only, so structurally incapable of push; also gated (below) |
+
+The unknown that blocks progress is how a client obtains the real
+`user_client_id` the app keeps under `user_client_id_1208`. It appears to come
+from a device-registration step that has not been found in the decompiled
+sources. Everything else about the connection works.
+
+> **A caution learned the hard way.** paho's network loop reconnects on its own,
+> so an `rc=5` refusal becomes a connect-refuse-retry loop several times a
+> minute against Lockly's broker. Treat `rc=5` as permanent and stop the loop.
+> Guessing at credentials means sending authenticated traffic at their
+> infrastructure, and that has consequences.
+
+### `v1/proto/handler` — request/response, not push
 
 ```
 POST /v1/proto/handler
 ```
 
-`ApiService.m59007G` posts a `Payload<LockLogRequestData>` and receives
-`MqttHttpResponse`. This is a request/response transport for the same message
-envelope MQTT carries, which makes it a promising path for Home Assistant —
-no broker ACL to satisfy and no persistent connection to keep alive. The
-payload shape has not yet been worked out; see `data/mqtt/model/` in the
-decompiled sources.
+`ApiService` posts a `Payload<LockLogRequestData>` and receives an
+`MqttHttpResponse`, carrying the same message envelope MQTT uses:
+
+```json
+{"header": {"name": "...", "namespace": "...", "requestId": "...", "timestamp": 0},
+ "payload": {"deviceId": "...", "startTime": "...", "endTime": "...",
+             "limit": 0, "offset": 0}}
+```
+
+Two things to be clear about:
+
+- **It cannot deliver push.** It is a request/response endpoint. Device-state
+  push goes through `DeviceStateController`, which subscribes via `PahoService`
+  — the broker is the only push transport.
+- **It is gated.** `isSupportQueryLockLogByMQTT()` requires
+  `isSupportWiFiLowEnergy()`, an explicit model list that excludes `PGD628FN`.
+
+It remains interesting for a different reason: `PGD728FG25` **is** on that list,
+so this is a plausible transport for the hub-less WiFi-native locks that cannot
+use `senddata` at all.
 
 ### Message format
 
@@ -1101,11 +1137,11 @@ The CRC covers all bytes of the frame **including** the type byte, but **excludi
 - **Where the host password lives.** Slot 0 of the lock's own credential list,
   readable over `0x93` (§24). The cloud's `hc` is a copy that can fall behind,
   though on the hardware tested here the two matched.
-- **MQTT authentication.** The broker wants a **client certificate**, not a
-  different username form: `MqttSSLSocketFactory` loads a CA, a client
-  certificate and a client private key into a `KeyManagerFactory` over TLSv1.2.
-  Without one, CONNECT is refused (`rc=5`), or accepted and then denied at
-  subscribe time (SUBACK `0x80`). See §17.
+- **MQTT client certificates exist.** `MqttSSLSocketFactory` loads a CA, a
+  client certificate and a client private key into a `KeyManagerFactory` over
+  TLSv1.2, so the broker does expect mutual TLS. Worth knowing — but presenting
+  them did **not** make the subscription work, so client identity was not the
+  blocker. Push is a roadblock; §17 lists everything tried.
 - **Lock-side error codes.** Tabulated in §25. A rejection is a short
   unencrypted frame with cmd-type `0C`; `cod=200` from the cloud says nothing
   about whether the lock acted.
