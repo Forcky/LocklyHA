@@ -23,6 +23,7 @@ from custom_components.lockly.api import (
     build_unlock_cmd,
     crc8_lockly,
     dedupe_credentials,
+    describe_open_type,
     derive_aes_key,
     encrypt_master_code,
     host_password_from,
@@ -371,6 +372,19 @@ def test_paging_log_frame() -> None:
     check("start time packed", bounded[base + 16:base + 26], "1A0812091E")
 
 
+def test_open_type_labels() -> None:
+    """Readable names for access-log event types, raw code when unknown."""
+    print("open type labels")
+    check("keypad unlock", describe_open_type("2"), "keypad")
+    check("physical key", describe_open_type("4"), "physical key")
+    check("low battery", describe_open_type("8"), "low battery")
+    check("one-time code", describe_open_type("21"), "one-time code")
+    # Unresolved codes must pass through rather than be guessed at — several
+    # entries sit behind constants that could not be read.
+    check("unknown code passes through", describe_open_type("45"), "type 45")
+    check("missing code", describe_open_type(None), "unknown")
+
+
 def test_credential_dedupe() -> None:
     """A re-requested page must not double every credential.
 
@@ -442,6 +456,7 @@ def main() -> int:
         test_log_no_credential_sentinel,
         test_log_padding_terminates,
         test_paging_log_frame,
+        test_open_type_labels,
         test_credential_dedupe,
         test_operator_resolution,
     ):

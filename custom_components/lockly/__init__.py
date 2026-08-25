@@ -28,6 +28,7 @@ from .api import (
     api_query_lock_log_paged,
     api_query_passwords,
     api_unlock,
+    describe_open_type,
     host_password_from,
 )
 from .capabilities import LockCapabilities, resolve_capabilities
@@ -509,7 +510,8 @@ class LocklyCoordinator(DataUpdateCoordinator):
                 {
                     "lock_id": lock_id,
                     "lock_name": lock.get("na") or lock.get("blename") or lock_id,
-                    "event_type": record.get("co") or "UNKNOWN",
+                    "event_type": describe_open_type(record.get("co")),
+                    "event_code": record.get("co"),
                     "user_id": str(record.get("pid") if record.get("pid") is not None else ""),
                     "user_name": operator or "",
                     "operator_candidates": candidates,
@@ -610,7 +612,8 @@ class LocklyCoordinator(DataUpdateCoordinator):
                     {
                         "lock_id": lock_id,
                         "lock_name": lock.get("na") or lock.get("blename") or lock_id,
-                        "event_type": event.get("co") or "UNKNOWN",
+                        "event_type": describe_open_type(event.get("co")),
+                    "event_code": event.get("co"),
                         "user_id": str(event.get("pid") if event.get("pid") is not None else ""),
                         "user_name": operator or "",
                         "operator_candidates": candidates,

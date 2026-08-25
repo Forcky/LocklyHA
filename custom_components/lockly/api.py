@@ -738,6 +738,36 @@ _BLE_ERRORS = {
 }
 
 
+# Access-log event types.  The app resolves these through a two-stage string
+# switch — the code maps to an index, and the index maps to a label hundreds of
+# lines away — so only entries where both halves could be read directly are
+# listed here.  Codes outside this set are reported as their raw number rather
+# than guessed at; several sit behind constants that could not be resolved.
+#
+# Note this identifies *how* the lock was opened, not which credential type was
+# used: fingerprint and RFID are distinguished via separate sensor lists that
+# these locks do not expose.
+_OPEN_TYPE_LABELS = {
+    "2": "keypad",
+    "4": "physical key",
+    "6": "lock clock updated",
+    "7": "alarm",
+    "8": "low battery",
+    "9": "emergency code",
+    "16": "guest code",
+    "17": "guest one-time code",
+    "21": "one-time code",
+    "31": "long-term guest one-time code",
+}
+
+
+def describe_open_type(code: str | None) -> str:
+    """Readable name for an access-log event type, or the raw code if unknown."""
+    if code is None:
+        return "unknown"
+    return _OPEN_TYPE_LABELS.get(str(code), f"type {code}")
+
+
 def describe_ble_error(code: str) -> str:
     """Human-readable meaning for a lock-side BLE error byte."""
     return _BLE_ERRORS.get(str(code).upper(), "unknown lock error")

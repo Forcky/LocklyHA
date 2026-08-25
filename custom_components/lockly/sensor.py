@@ -16,6 +16,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import LocklyCoordinator
+from .api import describe_open_type
 from .const import BATTERY_MAX_V, BATTERY_MIN_V, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -168,8 +169,9 @@ class LocklyLastAccessSensor(CoordinatorEntity, SensorEntity):
         if not event:
             return {}
         attrs: dict = {
-            # Raw numeric code from the lock; the label mapping is not yet ported.
+            # Raw numeric code, plus a readable name where the code is known.
             "event_code": event.get("co"),
+            "event_type": describe_open_type(event.get("co")),
             "credential_slot": event.get("pid"),
             "timestamp": event.get("tm"),
             "event_id": event.get("id"),
