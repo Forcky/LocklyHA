@@ -22,11 +22,19 @@ CONF_PASSWORD = "password"
 SCAN_INTERVAL_SECONDS = 30
 HISTORY_INTERVAL_SECONDS = 300  # 5 minutes — access log poll
 
+# First access-log fetch after setup. Short enough that Last Access populates
+# promptly, long enough to stay clear of the startup burst.
+
 # How far back to seed the access-log cursor on first sync.  getlkhist takes a
 # timestamp cursor and returns events oldest-first, so starting from 0 walks the
 # lock's entire history a page at a time — on a lock with years of records that
 # means "last access" reports something from years ago and never catches up.
 HISTORY_LOOKBACK_DAYS = 7
+
+# First access-log fetch after setup.  async_track_time_interval only fires
+# after a full interval, and HA can take minutes to reach this integration, so
+# without this Last Access stays blank for roughly ten minutes after a restart.
+HISTORY_INITIAL_DELAY_SECONDS = 30
 SENDDATA_TIMEOUT = 30
 
 SERVICE_LIST_GUESTS  = "list_guests"

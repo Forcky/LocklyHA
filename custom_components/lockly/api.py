@@ -21,6 +21,7 @@ from .capabilities import (
     CMD_QUERY_PASSWORDS,
     CMD_QUERY_STATUS,
     DEFAULT_CAPABILITIES,
+    LOG_RECORD_CHARS_WIDE,
     UNLOCK_TYPE_HOST,
     LockCapabilities,
 )
@@ -859,6 +860,169 @@ async def api_query_passwords(
         position = int(page.get("cur_page", position)) + 1
 
     return entries
+
+
+def build_query_log_cmd(
+    master_code: str,
+    uuid: str,
+    nonce: str | None = None,
+    caps: LockCapabilities | None = None,
+) -> str:
+    """Build a SyncUnlockRecord frame — reads the access log from the lock.
+
+    The cloud's getlkhist only serves what was uploaded historically, which on
+    the hardware tested here is either nothing or records years old.  The app
+    reads current activity from the lock instead, which is what this does.
+
+    Layout is the same shape as the other queries:
+
+        cmd + mc_len + enc_mc + nonce
+
+    The command code depends on the hardware — 0x53 for attendance locks, 0x78
+    for the wider "log 120" format, 0x04 otherwise.
+    """
+    caps = caps or DEFAULT_CAPABILITIES
+    enc_mc = encrypt_master_code(master_code, uuid)
+    raw = _assemble_fields(
+        caps.log_cmd_code,
+        f"{len(enc_mc) // 2:d}",
+        enc_mc,
+        (nonce or "").upper(),
+    )
+    return _aes_wrap(raw, derive_aes_key(master_code, uuid))
+
+
+def _decode_packed_datetime(hex12: str) -> int | None:
+    """Decode a 6-byte packed yyMMddHHmmss timestamp to epoch milliseconds.
+
+    Each byte holds one component as hex digits that read as decimal — 0x25 is
+    the year 25, not 37.  This is the inverse of the encoding used when building
+    a status query, and DataUtils.m86669x in the app.
+
+    Returned in the local timezone, since the lock keeps local wall-clock time.
+    """
+    if len(hex12) < 12:
+        return None
+    try:
+        parts = [int(hex12[i:i + 2], 16) for i in range(0, 12, 2)]
+    except ValueError:
+        return None
+    year, month, day, hour, minute, second = parts
+    if not (1 <= month <= 12 and 1 <= day <= 31 and hour < 24 and minute < 60 and second < 60):
+        return None
+    try:
+        stamp = datetime(2000 + year, month, day, hour, minute, second)
+    except ValueError:
+        return None
+    return int(stamp.timestamp() * 1000)
+
+
+def parse_log_ack(
+    ack_hex: str,
+    master_code: str,
+    uuid: str,
+    caps: LockCapabilities | None = None,
+) -> list[dict] | None:
+    """Parse a SyncUnlockRecord response into access-log records.
+
+    After the AES payload is decrypted, the first byte is a header and the rest
+    is a flat array of fixed-width records (SyncUnlockRecordCmd.getAllLockRecord):
+
+        date(6B) | open_type(1B) | slot(2B) | record_id(2B)
+
+    on the wide formats, or a 1-byte slot on the legacy one.  A trailing partial
+    record is ignored, as the app does.
+    """
+    caps = caps or DEFAULT_CAPABILITIES
+    width = caps.log_record_chars
+    h = ack_hex.upper()
+    try:
+        payload = bytes.fromhex(h[16:-2])
+        if len(payload) == 0 or len(payload) % 16 != 0:
+            code = h[16:18]
+            _LOGGER.debug(
+                "query log rejected: %s — %s", code, describe_ble_error(code)
+            )
+            return None
+        d = AES.new(derive_aes_key(master_code, uuid), AES.MODE_ECB).decrypt(payload).hex().upper()
+
+        body = d[2:]                      # first byte is a header
+        usable = len(body) - (len(body) % width)
+        records: list[dict] = []
+        for start in range(0, usable, width):
+            rec = body[start:start + width]
+            timestamp = _decode_packed_datetime(rec[0:12])
+            if timestamp is None:
+                # Zero padding at the end of the block decodes as an impossible
+                # date; that marks the end of the real records.
+                break
+            if width == LOG_RECORD_CHARS_WIDE:
+                slot = int(rec[14:16], 16) + int(rec[16:18], 16) * 256
+                record_id = int(rec[18:20], 16) + int(rec[20:22], 16) * 256
+                no_credential = slot == 0xFFFF
+            else:
+                slot = int(rec[14:16], 16)
+                record_id = int(rec[16:18], 16) + int(rec[18:20], 16) * 256
+                no_credential = slot == 0xFF
+            if no_credential:
+                # An all-ones slot is the "no credential" sentinel, used for
+                # events that are not somebody unlocking — auto-lock, door
+                # events and similar.  The cloud log uses the same convention
+                # (pid 255 in its one-byte form).
+                slot = None
+            records.append({
+                "tm": timestamp,
+                "co": str(int(rec[12:14], 16)),  # open type, as getlkhist reports it
+                "pid": slot,
+                "id": record_id,
+                "na": "",
+            })
+        return records
+    except Exception:
+        _LOGGER.exception("Failed to parse access log ACK: %s", ack_hex[:60])
+        return None
+
+
+async def api_query_lock_log(
+    session: aiohttp.ClientSession,
+    jwt: str,
+    email: str,
+    des3_key: bytes,
+    lock: dict,
+    nonce: str | None = None,
+    caps: LockCapabilities | None = None,
+) -> list[dict] | None:
+    """Read the access log directly from the lock via senddata."""
+    mc = str(lock["mc"])
+    uuid = lock["ID"]
+    cmd_hex = build_query_log_cmd(mc, uuid, nonce, caps)
+    req = {
+        "acct": email,
+        "hubid": lock.get("hubid", ""),
+        "dv": uuid,
+        "cmd": cmd_hex,
+        "mdna": lock.get("iotdm", ""),
+    }
+    para = des3_encrypt(des3_key, json.dumps(req, separators=(",", ":")))
+    try:
+        async with session.post(
+            API_BASE + "senddata",
+            json={**COMMON_BODY, "para": para},
+            headers=_headers(jwt),
+            timeout=aiohttp.ClientTimeout(total=SENDDATA_TIMEOUT),
+        ) as resp:
+            body = await resp.json(content_type=None)
+            cod = str(body.get("cod"))
+            if cod != "200" or "ACK" not in body:
+                _LOGGER.warning(
+                    "query lock log failed: cod=%s lock=%s (%s)",
+                    cod, lock.get("blename"), describe_cod(cod),
+                )
+                return None
+            return parse_log_ack(body["ACK"], mc, uuid, caps)
+    except Exception:
+        _LOGGER.exception("query lock log failed for lock %s", lock.get("blename"))
+        return None
 
 
 def dedupe_credentials(entries: list[dict]) -> list[dict]:

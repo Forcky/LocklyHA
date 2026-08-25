@@ -11,6 +11,7 @@ Run inside the Home Assistant container:
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 
 from Crypto.Cipher import AES
 
@@ -25,6 +26,7 @@ from custom_components.lockly.api import (
     encrypt_master_code,
     host_password_from,
     parse_ack,
+    parse_log_ack,
     parse_pwd_list_ack,
 )
 from custom_components.lockly import LocklyCoordinator
@@ -260,6 +262,81 @@ def test_rejection_is_not_parsed_as_data() -> None:
           parse_pwd_list_ack("A1B2C3D40A000C93FF98", MC, UUID), None)
 
 
+def test_log_command_selection() -> None:
+    """Which access-log command a lock uses, and its record width."""
+    print("access log command selection")
+    pgd628fn = resolve_capabilities({"mod": "PGD628FN", "fwv": "4.03.15"}, lock_type=21)
+    check("PGD628FN 4.03.15 is log120", pgd628fn.supports_log_120, True)
+    check("uses 0x78", pgd628fn.log_cmd_code, "78")
+    check("22-char records", pgd628fn.log_record_chars, 22)
+
+    # The gate is >= 4.03.10 and < 8.00.00; either side falls back.
+    below = resolve_capabilities({"mod": "PGD628FN", "fwv": "4.03.09"}, lock_type=21)
+    above = resolve_capabilities({"mod": "PGD628FN", "fwv": "8.00.01"}, lock_type=21)
+    check("below the gate falls back", below.log_cmd_code, "4")
+    check("above the gate falls back", above.log_cmd_code, "4")
+    check("fallback uses 20-char records", below.log_record_chars, 20)
+
+    # An unparseable version must fail closed, not guess.
+    unknown = resolve_capabilities({"mod": "PGD628FN", "fwv": "not-a-version"}, lock_type=21)
+    check("unparseable version fails closed", unknown.supports_log_120, False)
+
+
+def test_log_record_parsing() -> None:
+    """Decode access-log records read from the lock."""
+    print("access log record parsing")
+    caps = resolve_capabilities({"mod": "PGD628FN", "fwv": "4.03.15"}, lock_type=21)
+    # Header byte, then two 11-byte records:
+    #   date(6) | open_type(1) | slot(2 LE) | record_id(2 LE)
+    # Each date component is the decimal value written in hex, so 2026-08-25
+    # 09:30:15 is 1a 08 19 09 1e 0f — not the BCD-looking 26 08 25 09 30 15.
+    header = "00"
+    rec1 = "1A0819091E0F" + "0B" + "0700" + "6F55"   # 2026-08-25 09:30:15
+    rec2 = "1A08190A0F00" + "2E" + "0100" + "7055"   # 2026-08-25 10:15:00
+    parsed = parse_log_ack(_wrap_response(header + rec1 + rec2, "0A78"), MC, UUID, caps)
+
+    check("parsed", parsed is not None, True)
+    if not parsed:
+        return
+    check("two records", len(parsed), 2)
+    check("slot decoded", parsed[0]["pid"], 7)
+    check("open type decoded", parsed[0]["co"], "11")
+    check("record id decoded (LE)", parsed[0]["id"], 0x556F)
+    check("second slot", parsed[1]["pid"], 1)
+    stamp = datetime.fromtimestamp((parsed[0]["tm"] or 0) / 1000)
+    check("timestamp decodes to the packed date",
+          stamp.strftime("%Y-%m-%d %H:%M:%S"), "2026-08-25 09:30:15")
+    check("records ordered as received", parsed[1]["tm"] > parsed[0]["tm"], True)
+
+
+def test_log_no_credential_sentinel() -> None:
+    """An all-ones slot means "no credential", not slot 65535.
+
+    Auto-lock and door events carry this; reporting them as a numbered slot
+    makes a "last access" sensor claim a person was involved when none was.
+    """
+    print("access log no-credential sentinel")
+    caps = resolve_capabilities({"mod": "PGD628FN", "fwv": "4.03.15"}, lock_type=21)
+    sentinel = "1A0819091E0F" + "2A" + "FFFF" + "6F55"   # slot 0xFFFF
+    real = "1A08190A0F00" + "0B" + "0700" + "7055"       # slot 7
+    parsed = parse_log_ack(_wrap_response("00" + sentinel + real, "0A78"), MC, UUID, caps)
+
+    check("parsed", parsed is not None, True)
+    if not parsed:
+        return
+    check("sentinel slot becomes None", parsed[0]["pid"], None)
+    check("real slot preserved", parsed[1]["pid"], 7)
+
+
+def test_log_padding_terminates() -> None:
+    """Zero padding after the last record must not become a bogus entry."""
+    print("access log padding")
+    caps = resolve_capabilities({"mod": "PGD628FN", "fwv": "4.03.15"}, lock_type=21)
+    one = "1A0819091E0F" + "0B" + "0700" + "6F55"
+    parsed = parse_log_ack(_wrap_response("00" + one, "0A78"), MC, UUID, caps)
+    check("exactly one record", len(parsed) if parsed is not None else -1, 1)
+
+
 def test_credential_dedupe() -> None:
     """A re-requested page must not double every credential.
 
@@ -326,6 +403,10 @@ def main() -> int:
         test_user_type_2_has_no_schedule,
         test_no_passwords_sentinel,
         test_rejection_is_not_parsed_as_data,
+        test_log_command_selection,
+        test_log_record_parsing,
+        test_log_no_credential_sentinel,
+        test_log_padding_terminates,
         test_credential_dedupe,
         test_operator_resolution,
     ):

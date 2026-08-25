@@ -154,7 +154,10 @@ class LocklyLastAccessSensor(CoordinatorEntity, SensorEntity):
             return operator
         pid = event.get("pid")
         if pid is None:
-            return "Unknown"
+            # No credential attached — an auto-lock or door event rather than
+            # somebody unlocking.  Saying "Unknown person" would be wrong; there
+            # was no person.
+            return "No credential"
         if event.get("operator_candidates"):
             return f"Slot {pid} (ambiguous)"
         return f"Slot {pid}"

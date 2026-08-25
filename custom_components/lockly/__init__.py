@@ -10,7 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
@@ -24,6 +24,7 @@ from .api import (
     api_lock,
     api_login,
     api_query_lock_status,
+    api_query_lock_log,
     api_query_passwords,
     api_unlock,
     host_password_from,
@@ -34,6 +35,7 @@ from .const import (
     CONF_EMAIL,
     CONF_PASSWORD,
     DOMAIN,
+    HISTORY_INITIAL_DELAY_SECONDS,
     HISTORY_INTERVAL_SECONDS,
     HISTORY_LOOKBACK_DAYS,
     SCAN_INTERVAL_SECONDS,
@@ -112,6 +114,12 @@ class LocklyCoordinator(DataUpdateCoordinator):
         # Host password read from each lock, which is authoritative over the
         # cloud's "hc" copy.  None means "queried and the lock had no slot 0".
         self._host_passwords: dict[str, str | None] = {}
+        # Locks whose cloud access log is barren and whose cursor never moves;
+        # these are read from the lock itself instead.
+        self._cloud_history_exhausted: set[str] = set()
+        # Record ids already surfaced from a lock's own log, so re-reading it
+        # does not re-fire events for activity we have already reported.
+        self._seen_log_ids: dict[str, set] = {}
         # MQTT push configuration from getHeartbeatTime.  The broker authorises
         # subscriptions by client identity, and client_id is the only one the
         # API exposes; None means we never got it and fall back to defaults.
@@ -367,13 +375,26 @@ class LocklyCoordinator(DataUpdateCoordinator):
         return next((l for l in self.locks if l["ID"] == lock_id), None)
 
     def async_start_history_polling(self) -> None:
-        """Register the 5-minute access log poll timer. Call after platform setup."""
+        """Register the access log poll timer and do one fetch shortly after setup.
+
+        ``async_track_time_interval`` only fires after a full interval, and HA
+        can take minutes to reach this integration, so waiting for the first
+        tick leaves Last Access blank for roughly ten minutes after a restart —
+        and any restart inside that window resets the clock without a single
+        fetch ever happening.  A short initial delay avoids that while still
+        staying clear of the startup burst.
+        """
         cancel = async_track_time_interval(
             self.hass,
             self._async_poll_history,
             timedelta(seconds=HISTORY_INTERVAL_SECONDS),
         )
         self._history_cancel.append(cancel)
+        self._history_cancel.append(
+            async_call_later(
+                self.hass, HISTORY_INITIAL_DELAY_SECONDS, self._async_poll_history
+            )
+        )
 
     @staticmethod
     def _resolve_operator(lock: dict, event: dict) -> tuple[str | None, list[str]]:
@@ -410,13 +431,93 @@ class LocklyCoordinator(DataUpdateCoordinator):
     def _history_start_cursor(self) -> int:
         """Where to begin reading the access log on first sync.
 
-        Seeded to a recent timestamp rather than 0: getlkhist walks forward from
-        the cursor oldest-first, so starting at 0 replays the lock's entire
-        history one page per poll.  On a lock with years of records that means
-        "last access" shows an event from years ago and never catches up.
+        Deliberately 0.  Seeding this to a recent timestamp seemed reasonable —
+        it avoids replaying old records — but in practice it returns nothing at
+        all for every lock, so ``time`` is not the "events after this" filter it
+        looks like.  Passing 0 does return events, so that is what we do, and
+        stale records are filtered on the way out instead (see
+        ``_is_recent_event``).
         """
+        return 0
+
+    async def _poll_lock_log(self, lock: dict) -> None:
+        """Read the access log from the lock itself and surface recent records.
+
+        Used where the cloud log is barren.  This wakes the lock, so it is only
+        reached once the cloud path has been shown to be useless for that lock.
+        """
+        lock_id = lock["ID"]
+        nonce = self._nonces.get(lock_id)
+        records = await api_query_lock_log(
+            self._session, self.jwt, self.email, self.des3_key, lock,
+            nonce=nonce, caps=self._caps_for(lock),
+        )
+        if records is None:
+            _LOGGER.debug(
+                "Lockly lock log: %s read failed", lock.get("blename") or lock_id
+            )
+            return
+
+        cutoff = self._history_cutoff_ms()
+        recent = [r for r in records if self._is_recent_event(r, cutoff)]
+        _LOGGER.debug(
+            "Lockly lock log: %s returned %d record(s), %d recent",
+            lock.get("blename") or lock_id, len(records), len(recent),
+        )
+        if not recent:
+            return
+
+        seen = self._seen_log_ids.setdefault(lock_id, set())
+        for record in sorted(recent, key=lambda r: r.get("tm") or 0):
+            if record.get("id") in seen:
+                continue
+            seen.add(record.get("id"))
+            operator, candidates = self._resolve_operator(lock, record)
+            record["operator"] = operator
+            record["operator_candidates"] = candidates
+            self.hass.bus.async_fire(
+                "lockly_lock_event",
+                {
+                    "lock_id": lock_id,
+                    "lock_name": lock.get("na") or lock.get("blename") or lock_id,
+                    "event_type": record.get("co") or "UNKNOWN",
+                    "user_id": str(record.get("pid") if record.get("pid") is not None else ""),
+                    "user_name": operator or "",
+                    "operator_candidates": candidates,
+                    "timestamp": record.get("tm") or 0,
+                    "event_id": record.get("id") or 0,
+                    "source": "lock",
+                },
+            )
+
+        if self.data and lock_id in self.data:
+            # Prefer the most recent record that identifies somebody.  Many
+            # records carry the "no credential" sentinel — auto-lock and door
+            # events — and reporting one of those as the last access answers a
+            # different question than the sensor is asking.
+            attributable = [r for r in recent if r.get("pid") is not None]
+            latest = max(attributable or recent, key=lambda r: r.get("tm") or 0)
+            self.async_set_updated_data(
+                {**self.data, lock_id: {**self.data[lock_id], "last_access_event": latest}}
+            )
+
+    def _history_cutoff_ms(self) -> int:
+        """Timestamp below which an access-log record is not worth surfacing."""
         lookback = timedelta(days=HISTORY_LOOKBACK_DAYS)
         return int((datetime.now(timezone.utc) - lookback).timestamp() * 1000)
+
+    @staticmethod
+    def _is_recent_event(event: dict, cutoff_ms: int) -> bool:
+        """Whether an event is recent enough to surface.
+
+        Filtering happens here rather than via the request cursor because the
+        cursor does not filter reliably, and because some locks report events
+        with implausible timestamps — high event ids carrying dates years in the
+        past, which looks like a lock whose clock was never set. Those must not
+        be presented as the most recent access.
+        """
+        tm = event.get("tm") or 0
+        return tm >= cutoff_ms
 
     async def _async_poll_history(self, _now=None) -> None:
         if not self.jwt or self.des3_key is None or not self.locks:
@@ -428,15 +529,47 @@ class LocklyCoordinator(DataUpdateCoordinator):
             if since_ms is None:
                 since_ms = self._history_start_cursor()
                 self._history_cursors[lock_id] = since_ms
+            if lock_id in self._cloud_history_exhausted:
+                # getlkhist has already proven barren for this lock; re-asking
+                # returns the same dead page forever.
+                await self._poll_lock_log(lock)
+                continue
+
             result = await api_get_lock_history(
                 self._session, self.jwt, self.des3_key, self.email, lock_id, since_ms
             )
             if result is None:
+                _LOGGER.debug(
+                    "Lockly history: %s request FAILED (cursor was %s)",
+                    lock.get("blename") or lock_id, since_ms,
+                )
                 continue
             events, new_cursor = result
+            # Logged even when empty: otherwise a lock that never returns events
+            # is indistinguishable from one that was never polled.
+            _LOGGER.debug(
+                "Lockly history: %s returned %d event(s), cursor %s -> %s",
+                lock.get("blename") or lock_id, len(events), since_ms, new_cursor,
+            )
             if new_cursor > since_ms:
                 self._history_cursors[lock_id] = new_cursor
-            for event in events:
+
+            # Advance the cursor through everything, but only surface recent
+            # records.  Old ones still move the sync point forward; firing them
+            # would flood the bus and would make "last access" report a date
+            # from years ago.
+            cutoff = self._history_cutoff_ms()
+            recent = [e for e in events if self._is_recent_event(e, cutoff)]
+            if events and not recent:
+                oldest = min(e.get("tm") or 0 for e in events)
+                newest = max(e.get("tm") or 0 for e in events)
+                _LOGGER.debug(
+                    "Lockly history: %s — all %d event(s) older than the cutoff "
+                    "(tm range %s..%s, cutoff %s); advancing the cursor",
+                    lock.get("blename") or lock_id, len(events), oldest, newest, cutoff,
+                )
+
+            for event in recent:
                 _LOGGER.debug("lockly history event raw: %s", event)
                 operator, candidates = self._resolve_operator(lock, event)
                 # Resolution is attached to the event so the sensor and the bus
@@ -458,8 +591,21 @@ class LocklyCoordinator(DataUpdateCoordinator):
                 )
             # Update last_access_event on coordinator data so the sensor reflects it.
             # Use the event with the largest tm value (getlkhist returns oldest-first).
-            if events and self.data and lock_id in self.data:
-                latest = max(events, key=lambda e: e.get("tm", 0))
+            # Decide whether the cloud log is worth asking again.  A cursor that
+            # does not advance means we will be handed the same page forever, so
+            # once that page has nothing recent in it there is nothing to gain.
+            if new_cursor <= since_ms and not recent:
+                self._cloud_history_exhausted.add(lock_id)
+                _LOGGER.info(
+                    "Lockly: %s — the cloud access log has no recent records and "
+                    "its cursor does not advance; reading the log from the lock "
+                    "instead",
+                    lock.get("blename") or lock_id,
+                )
+                await self._poll_lock_log(lock)
+
+            if recent and self.data and lock_id in self.data:
+                latest = max(recent, key=lambda e: e.get("tm", 0))
                 updated = {
                     **self.data,
                     lock_id: {**self.data[lock_id], "last_access_event": latest},

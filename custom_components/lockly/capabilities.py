@@ -28,6 +28,21 @@ CMD_UNLOCK = "22"           # NewUnlockCmd, standard AES path
 CMD_UNLOCK_82 = "52"        # NewUnlockCmd, isSupport82Cmd path
 CMD_QUERY_PASSWORDS = "93"  # QueryPwd147Cmd — paginated credential list
 
+# SyncUnlockRecordCmd reads the access log from the lock itself.  Which code it
+# uses depends on the hardware: attendance locks use 0x53, locks with the "log
+# 120" format use 0x78, everything else 0x04.
+CMD_LOG_ATTENDANCE = "53"
+CMD_LOG_120 = "78"
+CMD_LOG_LEGACY = "4"
+
+# Characters per record in the log response.  The wider formats carry a 2-byte
+# credential slot where the legacy one carries a single byte.
+LOG_RECORD_CHARS_WIDE = 22
+LOG_RECORD_CHARS_LEGACY = 20
+
+# isSimpleAttendance(): PGI302FC / PGI303FC / PGI302W.
+_SIMPLE_ATTENDANCE = frozenset({51, 54, 67})
+
 # QueryPwdCmd.NO_PASSWOED: the sentinel frame meaning "this lock holds none".
 _NO_PASSWORDS_ACK = "a1b2c3d40a000c11019a"
 
@@ -122,6 +137,29 @@ MODEL_LOCK_TYPES = {
 }
 
 
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """Parse a dotted firmware string into comparable integers.
+
+    Returns an empty tuple for anything unparseable, so a version check on an
+    unknown string fails closed rather than guessing.
+    """
+    parts: list[int] = []
+    for part in str(version or "").split("."):
+        part = part.strip()
+        if not part.isdigit():
+            return ()
+        parts.append(int(part))
+    return tuple(parts)
+
+
+def _version_between(version: str, minimum: str, maximum: str) -> bool:
+    """True when minimum <= version < maximum, as the app's version gates read."""
+    current = _version_tuple(version)
+    if not current:
+        return False
+    return _version_tuple(minimum) <= current < _version_tuple(maximum)
+
+
 @dataclass(frozen=True)
 class LockCapabilities:
     """Frame-shaping capabilities for one lock."""
@@ -129,6 +167,7 @@ class LockCapabilities:
     lock_type: int = _LOCK_TYPE_FALLBACK
     model: str = ""
     is_host: bool = True
+    firmware: str = ""
 
     @property
     def supports_82_cmd(self) -> bool:
@@ -180,6 +219,38 @@ class LockCapabilities:
         return 0 if self.is_host else 1
 
     @property
+    def is_simple_attendance(self) -> bool:
+        """isSimpleAttendance(): attendance-style locks."""
+        return self.lock_type in _SIMPLE_ATTENDANCE
+
+    @property
+    def supports_log_120(self) -> bool:
+        """isSupportLog120(): the wider access-log record format.
+
+        PGD628FN qualifies from lock firmware 4.03.10 up to (not including)
+        8.00.00 — DeviceVersionManager's gate for this predicate.
+        """
+        if self.lock_type != 21:  # PGD628FN
+            return False
+        return _version_between(self.firmware, "4.03.10", "8.00.00")
+
+    @property
+    def log_cmd_code(self) -> str:
+        """BLE command that reads the access log from the lock."""
+        if self.is_simple_attendance:
+            return CMD_LOG_ATTENDANCE
+        if self.supports_log_120:
+            return CMD_LOG_120
+        return CMD_LOG_LEGACY
+
+    @property
+    def log_record_chars(self) -> int:
+        """Hex characters per record in the access-log response."""
+        if self.is_simple_attendance or self.supports_log_120:
+            return LOG_RECORD_CHARS_WIDE
+        return LOG_RECORD_CHARS_LEGACY
+
+    @property
     def needs_firmware_check(self) -> bool:
         """True when a firmware-gated predicate makes the frame choice uncertain."""
         return self.lock_type in _MAYBE_82_CMD
@@ -216,4 +287,5 @@ def resolve_capabilities(lock: dict, lock_type: int | None = None) -> LockCapabi
         lock_type=lock_type,
         model=model,
         is_host=str(lock.get("secondAdm") or "N").upper() != "Y",
+        firmware=str(lock.get("fwv") or ""),
     )
