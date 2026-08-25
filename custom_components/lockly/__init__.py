@@ -124,6 +124,9 @@ class LocklyCoordinator(DataUpdateCoordinator):
         self._seen_log_ids: dict[str, set] = {}
         # Locks whose bulk log read has failed; these use the paged query only.
         self._prefer_paged_log: set[str] = set()
+        # Locks whose access log has been read this session.  Reading it wakes
+        # the lock, so it is done once and then only on request.
+        self._lock_log_read: set[str] = set()
         # MQTT push configuration from getHeartbeatTime.  The broker authorises
         # subscriptions by client identity, and client_id is the only one the
         # API exposes; None means we never got it and fall back to defaults.
@@ -444,6 +447,26 @@ class LocklyCoordinator(DataUpdateCoordinator):
         """
         return 0
 
+    async def _maybe_read_lock_log(self, lock: dict, force: bool = False) -> None:
+        """Read the lock's access log at most once per session, unless forced.
+
+        Reading it goes over senddata, which wakes the lock — and a woken lock
+        beeps if its BLE sound is enabled, as well as costing battery.  Doing
+        that on the recurring poll made locks beep every few minutes, which is
+        exactly the trap AGENTS.md warns about: never call senddata from a poll
+        loop.
+
+        So the log is read once shortly after setup, and thereafter only when
+        asked for via lockly.read_access_log.  The cost of that is a Last Access
+        value that does not refresh on its own; the alternative is a lock that
+        beeps at the household every five minutes.
+        """
+        lock_id = lock["ID"]
+        if not force and lock_id in self._lock_log_read:
+            return
+        self._lock_log_read.add(lock_id)
+        await self._poll_lock_log(lock)
+
     async def _poll_lock_log(self, lock: dict) -> None:
         """Read the access log from the lock itself and surface recent records.
 
@@ -562,8 +585,12 @@ class LocklyCoordinator(DataUpdateCoordinator):
                 self._history_cursors[lock_id] = since_ms
             if lock_id in self._cloud_history_exhausted:
                 # getlkhist has already proven barren for this lock; re-asking
-                # returns the same dead page forever.
-                await self._poll_lock_log(lock)
+                # returns the same dead page forever.  Reading the log from the
+                # lock is NOT done here: it goes over senddata, which wakes the
+                # lock and makes it beep, and this runs every few minutes.  It
+                # happens once at startup and on demand instead — see
+                # _maybe_read_lock_log.
+                await self._maybe_read_lock_log(lock)
                 continue
 
             result = await api_get_lock_history(
@@ -634,7 +661,7 @@ class LocklyCoordinator(DataUpdateCoordinator):
                     "instead",
                     lock.get("blename") or lock_id,
                 )
-                await self._poll_lock_log(lock)
+                await self._maybe_read_lock_log(lock)
 
             if recent and self.data and lock_id in self.data:
                 latest = max(recent, key=lambda e: e.get("tm", 0))
@@ -760,6 +787,21 @@ def _register_services(hass: HomeAssistant, coordinator: LocklyCoordinator) -> N
             ),
         })
 
+    async def handle_read_access_log(call) -> None:
+        """Read a lock's access log on demand.
+
+        This is the manual counterpart to the single read at startup.  It wakes
+        the lock, so the lock will beep if its BLE sound is on — which is why it
+        is not on a timer.
+        """
+        lock_id = call.data["lock_id"]
+        lock = coordinator._get_lock(lock_id)
+        if lock is None:
+            _LOGGER.error("read_access_log: lock_id %s not found", lock_id)
+            return
+        await coordinator._maybe_read_lock_log(lock, force=True)
+
+    hass.services.async_register(DOMAIN, "read_access_log", handle_read_access_log, schema=_LIST_GUESTS_SCHEMA)
     hass.services.async_register(DOMAIN, "query_passwords", handle_query_passwords, schema=_LIST_GUESTS_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_LIST_GUESTS,  handle_list_guests,  schema=_LIST_GUESTS_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_ADD_GUEST,    handle_add_guest,    schema=_ADD_GUEST_SCHEMA)

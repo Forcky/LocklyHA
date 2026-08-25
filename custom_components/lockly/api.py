@@ -474,17 +474,18 @@ def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
             "firmware_version": d[0:8],
             "is_locked": not bool((status_byte >> 1) & 1),
             "battery_invalid": bool((status_byte >> 4) & 1),
-            # Door sensor flags are deliberately NOT derived from this byte.
-            # Captured from four locks whose sensor fitment is known: the two
-            # WITH a wired sensor report 0x00, and the two without report 0x01.
-            # So bit 0 — which this previously reported as "wired sensor
-            # connected" — is set exactly on the locks that have no sensor, and
-            # no bit is set on the ones that do.  Whatever bit 0 means, it is
-            # not sensor presence, and a positive "sensor fitted" flag is not in
-            # this byte.  Reporting a fabricated "door closed" for a lock with
-            # no sensor is worse than reporting nothing, so the door sensor now
-            # relies solely on lock/cachedstatus/get, whose sts bitmap has
-            # documented HAS_WIRED_DS / HAS_RF_DS bits (§14).
+            # Bit 0 is inverted relative to what the protocol notes claimed: it
+            # is SET when the lock has NO wired door sensor.  Captured from four
+            # locks whose fitment is known to the owner — the two with a sensor
+            # report 0x00, the two without report 0x01 — so this is 4/4 rather
+            # than inference from the docs.
+            "wired_door_sensor_connected": not bool(status_byte & 1),
+            # Polarity of the open/closed bit is NOT confirmed.  Every lock read
+            # so far had its door shut and reported 0 here, which is consistent
+            # with 0 = closed but does not prove it; nothing has yet been seen
+            # with a door open.  Treat a reported "open" with suspicion until a
+            # door has been opened and re-read.
+            "door_sensor_open": bool((status_byte >> 2) & 1),
         }
         if len(d) >= 14:
             result["wakeup_voltage"] = int(d[10:12], 16) + int(d[12:14], 16) * 256

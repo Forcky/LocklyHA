@@ -109,3 +109,19 @@ query_passwords:
       example: "300021003131471535373831"
       selector:
         text:
+
+read_access_log:
+  name: Read access log
+  description: >-
+    Reads the access log directly from the lock and updates the Last Access
+    sensor. This is done once automatically after startup; use this to refresh
+    it. It wakes the lock, so the lock will beep if its BLE sound is enabled —
+    which is why it is not on a timer.
+  fields:
+    lock_id:
+      name: Lock ID
+      description: The lock's device UUID (the ID field, 24 hex characters).
+      required: true
+      example: "280033003131470432353835"
+      selector:
+        text:
