@@ -44,6 +44,14 @@ SENDDATA_TIMEOUT = 30
 # every attempt wakes the lock and some models beep when woken.
 LIVE_INIT_MAX_ATTEMPTS = 3
 
+# After those attempts are exhausted, one quiet probe on this interval, so a
+# hub that comes back is noticed without needing an HA restart.  A single
+# attempt rather than the startup burst, because this repeats for as long as the
+# failure lasts and every attempt wakes the lock.  Long enough that a lock stuck
+# unreachable for days is not woken often; short enough that recovery is picked
+# up while someone is still standing at the door wondering why.
+LIVE_INIT_REARM_SECONDS = 1800
+
 SERVICE_LIST_GUESTS  = "list_guests"
 SERVICE_ADD_GUEST    = "add_guest"
 SERVICE_DELETE_GUEST = "delete_guest"

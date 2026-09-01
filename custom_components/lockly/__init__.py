@@ -41,6 +41,7 @@ from .const import (
     HISTORY_INTERVAL_SECONDS,
     HISTORY_LOOKBACK_DAYS,
     LIVE_INIT_MAX_ATTEMPTS,
+    LIVE_INIT_REARM_SECONDS,
     SCAN_INTERVAL_SECONDS,
     SERVICE_ADD_GUEST,
     SERVICE_DELETE_GUEST,
@@ -107,6 +108,8 @@ class LocklyCoordinator(DataUpdateCoordinator):
         # Lock ID -> live-status attempts so far.  Present means still trying;
         # removed means either seeded successfully or given up on.
         self._live_init_attempts: dict[str, int] = {}
+        # Lock ID -> loop time at which a given-up lock may be probed again.
+        self._live_init_retry_at: dict[str, float] = {}
         # Access log polling state.
         self._history_cursors: dict[str, int] = {}  # lock_id -> LAST_EVENT_SYNC_TIME ms
         self._history_cancel: list = []
@@ -175,6 +178,7 @@ class LocklyCoordinator(DataUpdateCoordinator):
             await mqtt.async_reconnect()
         self._cache_supported = True
         self._live_init_attempts = {lock["ID"]: 0 for lock in self.locks}
+        self._live_init_retry_at.clear()
         _LOGGER.info("Lockly: authenticated, found %d lock(s)", len(self.locks))
         for lock in self.locks:
             name = lock.get("na") or lock.get("blename") or lock["ID"]
@@ -283,13 +287,37 @@ class LocklyCoordinator(DataUpdateCoordinator):
                     del self._live_init_attempts[lock_id]
                 elif attempts >= LIVE_INIT_MAX_ATTEMPTS:
                     del self._live_init_attempts[lock_id]
+                    self._live_init_retry_at[lock_id] = (
+                        self.hass.loop.time() + LIVE_INIT_REARM_SECONDS
+                    )
                     _LOGGER.warning(
                         "Lockly: %s returned no status in %d attempts — its "
-                        "state and door sensor stay unavailable until a command "
-                        "is sent to it or HA restarts",
+                        "state and door sensor stay unavailable for now; "
+                        "retrying quietly every %d minutes",
                         lock.get("na") or lock.get("blename") or lock_id,
                         LIVE_INIT_MAX_ATTEMPTS,
+                        LIVE_INIT_REARM_SECONDS // 60,
                     )
+            elif status is None and lock_id in self._live_init_retry_at:
+                # A lock we gave up on. One probe per interval, so a hub that
+                # comes back is picked up on its own — previously the only
+                # recovery was restarting HA, which meant a lock could sit
+                # stateless indefinitely after a transient hub failure. Silent
+                # on failure: the warning above was already logged once, and
+                # repeating it every interval would just be noise.
+                if self.hass.loop.time() >= self._live_init_retry_at[lock_id]:
+                    self._live_init_retry_at[lock_id] = (
+                        self.hass.loop.time() + LIVE_INIT_REARM_SECONDS
+                    )
+                    status = await api_query_lock_status(
+                        self._session, self.jwt, self.email, self.des3_key, lock
+                    )
+                    if status:
+                        del self._live_init_retry_at[lock_id]
+                        _LOGGER.info(
+                            "Lockly: %s is responding again",
+                            lock.get("na") or lock.get("blename") or lock_id,
+                        )
 
             if status:
                 self._learn_from_status(lock, status)
