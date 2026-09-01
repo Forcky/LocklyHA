@@ -10,6 +10,8 @@ from pathlib import Path
 import paho.mqtt.client as paho
 from homeassistant.core import HomeAssistant
 
+from .api import mask_email
+
 _LOGGER = logging.getLogger(__name__)
 
 _BROKER = "mqttuswest02-lb-001-b5ed8c5e37b3a497.elb.us-west-2.amazonaws.com"
@@ -204,9 +206,17 @@ class LocklyMQTTManager:
             # hardcoded PgConfig value is only the fallback.
             host = getattr(self._coordinator, "mqtt_host", None) or _BROKER
             port = getattr(self._coordinator, "mqtt_port", None) or _PORT
+            # The address is masked: this line is a routine paste into public
+            # issues, and the diagnostic value is the client id and its
+            # provenance, not who the account belongs to.
+            log_username = (
+                f"{server_client_id}_{mask_email(email)}"
+                if server_client_id
+                else mask_email(email)
+            )
             _LOGGER.debug(
                 "Lockly MQTT connecting to %s:%s as %s (client id %s)",
-                host, port, username,
+                host, port, log_username,
                 "from API" if server_client_id else "generated",
             )
             await self._hass.async_add_executor_job(

@@ -28,6 +28,7 @@ from custom_components.lockly.api import (
     derive_aes_key,
     encrypt_master_code,
     host_password_from,
+    mask_email,
     parse_ack,
     parse_log_ack,
     parse_pwd_list_ack,
@@ -265,6 +266,21 @@ def test_rejection_is_not_parsed_as_data() -> None:
           parse_pwd_list_ack("A1B2C3D40A000C93FF98", MC, UUID), None)
 
 
+def test_email_masking() -> None:
+    """Debug logs get pasted into public issues, so the address must not be in them."""
+    print("account address masking")
+    check("ordinary address", mask_email("dylanburr20@gmail.com"), "d***@gmail.com")
+    check("domain kept for triage", mask_email("a@b.co").endswith("@b.co"), True)
+    check("local part not recoverable",
+          "ylanburr" in mask_email("dylanburr20@gmail.com"), False)
+    check("no address", mask_email(""), "(unset)")
+    check("None", mask_email(None), "(unset)")
+    check("not an address still masked", mask_email("notanemail"), "n***")
+    check("single-char local", mask_email("x@y.com"), "x***@y.com")
+    check("plus-addressing hidden",
+          mask_email("me+lockly@example.com"), "m***@example.com")
+
+
 def test_status_nack_is_not_data() -> None:
     """A bare error byte from the lock is a failure, not a status frame.
 
@@ -474,6 +490,7 @@ def main() -> int:
         test_no_passwords_sentinel,
         test_rejection_is_not_parsed_as_data,
         test_status_nack_is_not_data,
+        test_email_masking,
         test_log_command_selection,
         test_log_record_parsing,
         test_log_no_credential_sentinel,

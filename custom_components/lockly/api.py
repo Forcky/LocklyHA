@@ -814,6 +814,22 @@ def describe_open_type(code: str | None) -> str:
     return _OPEN_TYPE_LABELS.get(str(code), f"type {code}")
 
 
+def mask_email(address: str | None) -> str:
+    """Mask an account address for logging.
+
+    This integration asks reporters to paste debug logs into public issues, so
+    anything logged should be assumed public. One address has already ended up
+    on a GitHub issue that way. Keeping the domain and a single character is
+    enough to tell two accounts apart in a log without publishing either.
+    """
+    if not address:
+        return "(unset)"
+    local, sep, domain = str(address).partition("@")
+    if not sep:
+        return f"{local[:1]}***"
+    return f"{local[:1]}***@{domain}"
+
+
 def describe_ble_error(code: str) -> str:
     """Human-readable meaning for a lock-side BLE error byte."""
     return _BLE_ERRORS.get(str(code).upper(), "unknown lock error")
