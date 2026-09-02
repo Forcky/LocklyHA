@@ -161,12 +161,20 @@ class LocklyCoordinator(DataUpdateCoordinator):
             self._session, self.jwt, self.des3_key, self.config_entry.entry_id
         )
         if heartbeat:
-            self.mqtt_client_id = heartbeat.get("client_id")
+            client_id = heartbeat.get("client_id")
+            # The endpoint echoes back the device id it was given rather than
+            # assigning one, so an equal value carries no information.  Treating
+            # it as real builds the broker username "{our own id}_{email}", and
+            # the broker rejects that outright where the bare email is at least
+            # accepted.  A fabricated identity is worse than none.
+            echoed = bool(client_id) and client_id == self.config_entry.entry_id
+            self.mqtt_client_id = None if echoed else client_id
             self.mqtt_host = heartbeat.get("host")
             self.mqtt_port = heartbeat.get("port")
             _LOGGER.info(
                 "Lockly: MQTT config from getHeartbeatTime — client_id=%s host=%s port=%s",
-                "present" if self.mqtt_client_id else "absent",
+                "echoed back (ignored)" if echoed
+                else ("present" if self.mqtt_client_id else "absent"),
                 self.mqtt_host or "(default)",
                 self.mqtt_port or "(default)",
             )
