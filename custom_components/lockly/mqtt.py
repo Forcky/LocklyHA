@@ -202,10 +202,23 @@ class LocklyMQTTManager:
                 )
             )
             await self._hass.async_add_executor_job(cli.tls_insecure_set, True)
-            # getHeartbeatTime returns the authoritative broker address; the
-            # hardcoded PgConfig value is only the fallback.
-            host = getattr(self._coordinator, "mqtt_host", None) or _BROKER
-            port = getattr(self._coordinator, "mqtt_port", None) or _PORT
+            # PgConfig's hardcoded address, not the one getHeartbeatTime
+            # returns.  A network capture of the official app shows it
+            # connecting to this host, and the API-reported address refuses
+            # CONNECT outright with rc=5 where this one is accepted (and then
+            # refuses the subscription, which is the real blocker).  Preferring
+            # the API's address looked more correct and was strictly worse.
+            # Host and port travel together: taking the port from a different
+            # broker's config would be meaningless.
+            host, port = _BROKER, _PORT
+            api_host = getattr(self._coordinator, "mqtt_host", None)
+            if api_host and api_host != host:
+                _LOGGER.debug(
+                    "Lockly MQTT: using PgConfig broker %s, not the address the "
+                    "API reported (%s) — the app uses the former and the latter "
+                    "refuses CONNECT",
+                    host, api_host,
+                )
             # The address is masked: this line is a routine paste into public
             # issues, and the diagnostic value is the client id and its
             # provenance, not who the account belongs to.
