@@ -937,10 +937,35 @@ far is closed, and the notes below exist so nobody repeats the work.
 | The broker address `getHeartbeatTime` reports | A different host from `PgConfig`'s, and it refuses CONNECT outright (`rc=5`) |
 | `POST v1/proto/handler` | Request/response only, so structurally incapable of push; also gated (below) |
 
-The unknown that blocks progress is how a client obtains the real
-`user_client_id` the app keeps under `user_client_id_1208`. It appears to come
-from a device-registration step that has not been found in the decompiled
-sources. Everything else about the connection works.
+**This is closed, and the reason is now known.** It was previously recorded here
+as an open question about how a client obtains the `user_client_id` the app
+keeps under `user_client_id_1208`. Tracing it through the *Lockly Home* tree
+(`jadx_home_out`, which was not being searched) answers it:
+
+1. `LoginRepositoryImpl` calls `LockerConfig.ob(account, clientId)` on a
+   successful login. The client id is *passed into* the login call rather than
+   returned by it, so it is chosen by the client, not assigned by the server.
+   Supplying our own value was never the problem.
+2. Immediately after, login fires
+   `JobService.A("com.pingenie.pro.push.action.login.register.push.service")`.
+3. That action runs `JobService.u()`, which reads `LockerConfig.j0()` — and
+   `j0()` returns `SpUtils.o("fcm_token_1026", "")`, a **Firebase Cloud
+   Messaging token**. With no token it takes the no-token branch and never
+   registers.
+
+So the broker authorises a subscription only for a client identity that has been
+registered through FCM-backed push registration. An FCM token belongs to a real
+Android installation of Lockly's own Firebase project, which Home Assistant
+cannot obtain.
+
+That makes the `SUBACK 0x80` refusal correct behaviour rather than a
+misconfiguration, and it means **real-time push over this broker is not
+implementable for this integration**. Do not spend further effort on broker
+credentials, usernames or client ids: the connection stage already works, and
+the subscription stage is gated behind something unobtainable.
+
+The same dependency was already noted for the MPPS channel in §22, which should
+have been the clue.
 
 > **A caution learned the hard way.** paho's network loop reconnects on its own,
 > so an `rc=5` refusal becomes a connect-refuse-retry loop several times a
