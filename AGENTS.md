@@ -25,9 +25,33 @@ docs/
   api.md            # Full protocol reference (reverse-engineering findings)
 lockly_apk_analysis/
   FINDINGS.md       # Reverse-engineering notes
-  jadx_out/         # Decompiled APK Java source (read-only reference)
+  jadx_out/         # Decompiled "LOCKLY" app (locklyLiteAlpha 3.2.9)
+  jadx_home_out/    # Decompiled "Lockly Home" app (locklyHomeGp 1.4.8)
   lockly_traffic.jsonl  # Captured live API traffic (read-only reference)
 ```
+
+### Searching the decompiled apps
+
+**There are two decompiled trees, not one.** Lockly ships two apps that talk to
+the same API and differ mainly in UI and a few features. `jadx_home_out` is the
+larger of the two (34k Java files against 30k), so it holds code the other does
+not. Search both before concluding something is absent: a claim that an endpoint
+"does not exist in the app" was posted to a GitHub issue after searching only
+`jadx_out`, and the endpoint was in `PgConfig.java` in both.
+
+Note the versions. Users report from newer builds than these, so an absent
+feature may simply postdate the copy here.
+
+**`data/config/PgConfig.java` is the authoritative endpoint list.** It holds every
+base URL and the MQTT broker address. Read it before assuming which host serves
+what — `apiserv03c/pgsmtlkv2/api/` is the lock API, while `apiserv04c` hosts
+payments, messaging and push under separate paths.
+
+**Whole-tree greps time out.** Both trees are far too large for an unscoped
+`grep -r`, and a timeout looks identical to "no matches" if you are not careful.
+Scope every search to a subdirectory (`sources/android/content/res/data` is
+usually the right one) and wrap it in `timeout`. If a search returns nothing,
+confirm it actually completed before treating that as evidence.
 
 ---
 
@@ -122,24 +146,31 @@ from Crypto.Cipher import AES, DES3
 from Crypto.PublicKey import RSA
 ```
 
-### 6. `_pending_live_init` must be discarded unconditionally
+### 6. The live status query must stay bounded
 
-`_pending_live_init` tracks locks that still need a one-time startup BLE query. The discard **must happen before** calling `api_query_lock_status`, not inside the success branch:
+The startup BLE query that seeds state when `cachedstatus` is unavailable is
+tracked by `_live_init_attempts` (attempts so far) and `_live_init_retry_at`
+(when a given-up lock may be probed again). On hubs where `cachedstatus` is
+unsupported, every poll produces `status = None`, so an unbounded retry here
+calls `senddata` on every 30-second poll and makes the lock beep constantly.
+That regression has already shipped once.
 
-```python
-# CORRECT — always one-time, even if query fails
-if status is None and lock_id in self._pending_live_init:
-    self._pending_live_init.discard(lock_id)
-    status = await api_query_lock_status(...)
+Equally, do not swing to the other extreme. This was previously a single
+attempt discarded unconditionally, and one transient NACK or hub timeout then
+left a lock with no state, and its door sensor unavailable, until HA restarted.
+A hub outage lasting five days was observed recovering on its own with nothing
+asking.
 
-# WRONG — failed queries stay in the set and are retried every poll
-if status is None and lock_id in self._pending_live_init:
-    status = await api_query_lock_status(...)
-    if status is not None:
-        self._pending_live_init.discard(lock_id)  # never reached on failure
-```
+The shape that satisfies both:
 
-On hubs where `cachedstatus` is unsupported (`_cache_supported = False`), every poll produces `status = None`. If a lock stays in `_pending_live_init` after a failed query, `api_query_lock_status` (senddata) is called again on every 30-second poll — making the lock beep constantly and leaving its `is_locked` field unpopulated (showing as unavailable in HA).
+- up to `LIVE_INIT_MAX_ATTEMPTS` attempts, one per poll cycle, cleared on success
+- one warning when they are exhausted, then quiet
+- afterwards one probe per `LIVE_INIT_REARM_SECONDS`, silent on failure, info on
+  recovery
+
+Any change here must keep the wake rate low enough that a permanently
+unreachable lock is not woken often, while still recovering on its own. Roughly
+two wakes an hour is the current budget; the beeping regression was twelve.
 
 ### 7. Optimistic state updates after commands
 
