@@ -937,9 +937,56 @@ far is closed, and the notes below exist so nobody repeats the work.
 | The broker address `getHeartbeatTime` reports | A different host from `PgConfig`'s, and it refuses CONNECT outright (`rc=5`) |
 | `POST v1/proto/handler` | Request/response only, so structurally incapable of push; also gated (below) |
 
-**This is closed, and the reason is now known.** It was previously recorded here
-as an open question about how a client obtains the `user_client_id` the app
-keeps under `user_client_id_1208`. Tracing it through the *Lockly Home* tree
+> **Superseded.** The section below concluded that push is impossible because
+> the broker refuses the subscription and FCM gates registration. That is
+> **wrong on the central point**: we were subscribing to the wrong topic.
+> `server` is publish-only. The broker delivers to `client/<client_id>`, and it
+> was observed doing so with no subscription granted at all. The FCM chain
+> traced below is real but governs the app's *phone notification* registration
+> (Firebase, Xiaomi, AIPN), not the MQTT device channel. See
+> "Topics, corrected" immediately after.
+
+### Topics, corrected
+
+| Topic | Direction | Notes |
+|---|---|---|
+| `server` | client → broker | Publish only. `Message.TOPIC`. The app never subscribes to it; `Connection.java` has `publish()` and `messageArrived()` and no `subscribe()`. A `SUBACK 0x80` here is correct and harmless. |
+| `client/<client_id>` | broker → client | Replies and state callbacks. Verified: a published command was answered here with no SUBSCRIBE issued, so the broker holds a server-side subscription. |
+
+Sending a command, from `LockCommandController.sendCommand(bluetoothBean, byte[] bleData, ...)`:
+
+```json
+{"header":  {"namespace": "com.lockly", "name": "lockCommandRequest",
+             "requestId": "<uuid>", "timestamp": 1788496170204},
+ "payload": {"deviceId": "<lock uuid>", "commandName": "forward",
+             "commandContent": "<base64 of the same BLE frame senddata carries>"}}
+```
+
+`commandName` is `"forward"` (`LockCommandRequestData.COMMAND_NAME`): the server
+forwards the frame rather than interpreting it. Replies arrive as
+`lockCommandResponse`, or `exception` with a code:
+
+| Code | Meaning |
+|---|---|
+| `3005` | `device is offline` — the hub is not connected to this channel |
+
+Observed end to end against a real account: CONNECT accepted, PUBLISH acknowledged,
+and an `exception`/`3005` reply received. So the transport works in both
+directions; whether a *command* succeeds depends on the hub being online on the
+channel. A PGH220 on build 417 is not.
+
+This makes the MQTT channel a **second command transport** independent of
+`senddata`, which is the likely reason some accounts get `cod=930` from
+`senddata` while their app works normally.
+
+---
+
+The FCM trace below is retained because it is accurate about notification
+registration, and because it documents how a correct finding got attached to the
+wrong feature:
+
+**How the `user_client_id` is obtained.** It was previously recorded here
+as an open question. Tracing it through the *Lockly Home* tree
 (`jadx_home_out`, which was not being searched) answers it:
 
 1. `LoginRepositoryImpl` calls `LockerConfig.ob(account, clientId)` on a
@@ -953,19 +1000,21 @@ keeps under `user_client_id_1208`. Tracing it through the *Lockly Home* tree
    Messaging token**. With no token it takes the no-token branch and never
    registers.
 
-So the broker authorises a subscription only for a client identity that has been
-registered through FCM-backed push registration. An FCM token belongs to a real
-Android installation of Lockly's own Firebase project, which Home Assistant
-cannot obtain.
+So FCM registration is what enables the app's **notification** push: Firebase and
+Xiaomi notifications to the handset, the same dependency already noted for the
+MPPS channel in §22.
 
-That makes the `SUBACK 0x80` refusal correct behaviour rather than a
-misconfiguration, and it means **real-time push over this broker is not
-implementable for this integration**. Do not spend further effort on broker
-credentials, usernames or client ids: the connection stage already works, and
-the subscription stage is gated behind something unobtainable.
+**What this does not explain is the MQTT device channel**, and concluding that it
+did was a mistake worth recording. The reasoning was: the subscription is
+refused, here is an unobtainable credential in the login flow, therefore the
+subscription is gated on it. Each step looked sound and the conclusion was
+wrong, because the premise was never checked — we were subscribing to `server`,
+which no client subscribes to. One publish test produced a server reply on
+`client/<client_id>` and undid the whole chain.
 
-The same dependency was already noted for the MPPS channel in §22, which should
-have been the clue.
+The lesson is the cheap experiment first. Tracing FCM through two decompiled
+apps took far longer than the publish test that actually settled it, and the
+trace was performed on a question that only appeared to be the blocker.
 
 > **A caution learned the hard way.** paho's network loop reconnects on its own,
 > so an `rc=5` refusal becomes a connect-refuse-retry loop several times a

@@ -3,7 +3,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 [![GitHub Release](https://img.shields.io/github/v/release/Forcky/LocklyHA)](https://github.com/Forcky/LocklyHA/releases)
-[![Version](https://img.shields.io/badge/version-0.6.5-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.6.5)
+[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Control and monitor your **Lockly smart locks** from Home Assistant. This integration communicates with the Lockly cloud API using the same protocol as the official Lockly mobile app.
@@ -23,7 +23,7 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 | Door sensor state (if fitted) | ✅ Verified open and closed on a wired sensor |
 | Last access / who entered | ✅ Read from the lock; names resolve unless a slot is shared |
 | Guest PIN management (add / remove / list) | 🚧 In progress |
-| Real-time MQTT push (no-poll state updates) | ⛔ Not possible — requires an FCM token HA cannot obtain, see Known Limitations |
+| Real-time MQTT push (no-poll state updates) | 🚧 Works only if your hub is on the MQTT channel, see Known Limitations |
 | Multiple locks per account | ✅ |
 | Silent polling — lock does not beep during polls | ⚠️ Needs hub firmware ≥ build 422 |
 | Config flow UI | ✅ |
@@ -186,29 +186,39 @@ The integration polls `getlkhist` every 5 minutes for each lock and fires a `loc
 
 > **Status: 🚧 In progress** — event field names have been verified against the APK, but live hardware testing is still required.
 
-### MQTT real-time push (⛔ not available)
+### MQTT real-time push (🚧 depends on your hub)
 
-**This does not work, and it cannot be made to work.** The integration still
-attempts the connection at startup, because the attempt is cheap and the log
-line is a useful diagnostic, but no push message will ever arrive.
+The integration connects to the Lockly MQTT broker at startup and listens on its
+own client topic for state callbacks. Whether anything arrives depends on your
+hub being connected to that channel.
 
-The broker accepts the connection and then refuses the subscription. That
-refusal is correct behaviour rather than a misconfiguration: Lockly's broker
-only authorises a subscription for a client identity that has been registered
-through Firebase Cloud Messaging, and an FCM token belongs to a real Android
-installation of Lockly's own app. Home Assistant cannot obtain one.
+On the hardware this was developed against, a PGH220 on firmware build 417, the
+broker answers commands with `3005 device is offline` — the hub is not on the
+channel, so no push arrives and state behaves as described above. Newer hubs
+appear to be connected to it, since the official app uses this channel to
+control locks over WiFi.
 
-You will see this in the log, and it is expected:
+Earlier versions declared this impossible. That was wrong: the integration had
+been subscribing to `server`, which is a publish-only topic that no client reads
+from, and the broker was correctly refusing it. Replies and callbacks arrive on
+`client/<client_id>` instead.
+
+The broker grants this subscription, so the channel itself is open:
 
 ```
-Lockly MQTT connected, subscribing to 'server'
-Lockly MQTT: broker REFUSED the subscription to 'server' (SUBACK 0x80)
+Lockly MQTT connected, subscribing to 'client/…'
+Lockly MQTT subscribed to 'client/…' at qos=[0]
 ```
 
-Nothing is lost beyond instant updates. State is refreshed at startup and
-immediately after any command sent from HA. Changes made at the keypad or in
-the Lockly app are not seen until one of those happens, unless your hub
-firmware supports silent polling (see below).
+That is verified working, including on the build-417 hub. But a granted
+subscription only means the integration is listening — the hub still has to put
+state on the channel, and a hub reporting `device is offline` does not. So
+expect these lines regardless, and judge push by whether lock state actually
+changes when you use the keypad.
+
+A `SUBACK 0x80` refusal here is not fatal either, since the broker was also
+observed delivering a message without granting a subscription, so the connection
+is kept in both cases.
 
 ### Authentication
 
@@ -221,28 +231,6 @@ Credentials (email and password) are stored in HA's config entry. The integratio
 - **Locks with no PGH hub are not supported.** This covers both Bluetooth-only locks and WiFi-native models such as the `PGD728FG25`, which connect straight to WiFi. The `senddata` endpoint relays commands through a hub, so with an empty `hubid` the cloud returns `cod=930` for both state and commands. The integration now detects this and says so rather than reporting a bare error code. Supporting these locks needs a different API path (tracked in issue #2).
 - **Unlock is verified from 0.5.0.** Two fields in the command frame were wrong: the `str3` hub flag was sent as `00` instead of `01`, and the credential slot was sent as `1` instead of `0` (the host credential lives in slot 0). Both had to be right at once, which is why this took so long to find. Confirmed against physical hardware — a PGD628FN on firmware 4.03.15 behind a PGH220 hub.
 - **Silent polling requires hub firmware build ≥ 422** (for major-version-2 hubs). On older firmware `lock/cachedstatus/get` returns `cod=900` and state only updates at startup and after HA commands. Note that Lockly does not necessarily offer an upgrade: a PGH220 on `2.2.04.17` (build 417) reports itself up to date, five builds short of the requirement.
-- **Real-time push: not possible.** Not "in progress" and not merely unsolved — the blocker has been traced and is outside what any third-party client can do. State updates at startup and after commands from HA. What was tried:
-
-  | Attempt | Result |
-  |---|---|
-  | Broker with email username + JWT password | CONNECT accepted, subscription to `server` refused (SUBACK `0x80`) |
-  | Adding the app's client certificate (mTLS) | No change — client identity was not the blocker |
-  | `getHeartbeatTime` for a server-assigned client id | The returned `clientId` is an echo of the `deviceId` we send, so `{clientId}_{email}` is meaningless |
-  | The broker address the API reports | Different host from the hardcoded one, and it refuses CONNECT outright (`rc=5`) |
-  | `POST v1/proto/handler` over HTTP | Gated behind `isSupportWiFiLowEnergy()`, which excludes `PGD628FN`; and it is request/response, so it could not deliver push regardless — `DeviceStateController` subscribes via Paho, so push is broker-only |
-
-  **The reason is now known, and it is final.** The client id the app stores is
-  chosen by the client, not assigned by the server, so that was never the
-  obstacle. What follows login is a push-registration step that reads a
-  **Firebase Cloud Messaging token** and does nothing without one. The broker
-  authorises subscriptions only for identities registered that way, and an FCM
-  token belongs to a real Android installation of Lockly's Firebase project,
-  which Home Assistant cannot obtain.
-
-  So `SUBACK 0x80` is the broker behaving correctly. There is no credential,
-  username or client id that would change it, and attempts in that direction
-  mean sending authenticated traffic at Lockly's infrastructure for no
-  possible gain. See [`docs/api.md`](docs/api.md) §17 for the full trace.
 
 - **Door sensor state is verified, but sensor _presence_ cannot be read from the lock.** Bit 0 of the status byte is the door circuit: `0` = closed, `1` = open. A closed door completes the circuit and an open door breaks it — but a lock with no sensor fitted is an open circuit permanently, so it reads `1` too. That makes `1` ambiguous between "door open" and "no sensor fitted", and this ACK carries no separate presence flag. (The hub's `lock/cachedstatus/get` response does have one, at bit 1, but that endpoint needs newer hub firmware — see above.)
 

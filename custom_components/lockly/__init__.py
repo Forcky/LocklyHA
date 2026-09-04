@@ -27,6 +27,8 @@ from .api import (
     api_query_lock_log,
     api_query_lock_log_paged,
     api_query_passwords,
+    build_lock_cmd,
+    build_unlock_cmd,
     api_unlock,
     describe_open_type,
     host_password_from,
@@ -443,13 +445,44 @@ class LocklyCoordinator(DataUpdateCoordinator):
         )
         if ok:
             self._set_optimistic_lock_state(lock_id, is_locked=not unlock)
-        else:
-            _LOGGER.warning(
-                "Lockly: %s failed for %s — see the senddata warning above",
-                "unlock" if unlock else "lock",
-                lock.get("na") or lock.get("blename") or lock_id,
-            )
-        return ok
+            return True
+
+        _LOGGER.warning(
+            "Lockly: %s failed for %s — see the senddata warning above",
+            "unlock" if unlock else "lock",
+            lock.get("na") or lock.get("blename") or lock_id,
+        )
+        # Second transport. The app reaches some locks over the MQTT broker
+        # rather than senddata, which is why a few accounts get cod=930 from
+        # senddata while their app works fine. No optimistic state update here:
+        # a queued publish is not an acted-on command, and the server replies
+        # asynchronously on the client topic.
+        return await self._try_mqtt_command(lock, nonce, host_pwd, unlock=unlock)
+
+    async def _try_mqtt_command(
+        self, lock: dict, nonce: str | None, host_pwd: str | None, *, unlock: bool
+    ) -> bool:
+        """Publish a command over MQTT after senddata refused it.
+
+        Implemented but not verified end to end: on the only hardware available
+        to test, the broker accepts the publish and answers `3005 device is
+        offline`, meaning that hub is not connected to this channel. The frame
+        is the same one senddata carries, so nothing new is being guessed at.
+        """
+        mqtt = getattr(self, "_mqtt_manager", None)
+        if mqtt is None or not mqtt.connected:
+            return False
+        builder = build_unlock_cmd if unlock else build_lock_cmd
+        frame = builder(
+            str(lock["mc"]), lock["ID"], host_pwd or "", nonce,
+            caps=self._caps_for(lock),
+        )
+        _LOGGER.info(
+            "Lockly: retrying %s for %s over MQTT",
+            "unlock" if unlock else "lock",
+            lock.get("na") or lock.get("blename") or lock["ID"],
+        )
+        return await mqtt.async_send_lock_command(lock["ID"], frame)
 
     async def async_unlock_lock(self, lock_id: str) -> bool:
         return await self._send_command(lock_id, unlock=True)

@@ -1,7 +1,9 @@
 """Lockly MQTT manager — real-time lock state via Lockly Paho broker."""
 from __future__ import annotations
 
+import base64
 import json
+import time
 import logging
 import ssl
 import uuid
@@ -16,7 +18,19 @@ _LOGGER = logging.getLogger(__name__)
 
 _BROKER = "mqttuswest02-lb-001-b5ed8c5e37b3a497.elb.us-west-2.amazonaws.com"
 _PORT = 8883
-_TOPIC = "server"
+# Publish only. The app posts commands here and never subscribes to it:
+# Connection.java has publish() and messageArrived() and no subscribe() at all.
+# This integration subscribed to it for a long time and the broker refused every
+# time, correctly, because it is not a topic clients read from.
+_PUBLISH_TOPIC = "server"
+
+# Where the broker delivers replies and state callbacks: the client's own topic,
+# derived from the MQTT client id. Verified empirically — a published command was
+# answered on `client/<client_id>` with no SUBSCRIBE having been issued, so the
+# broker holds a server-side subscription for it. We subscribe anyway, because a
+# granted subscription is the documented way to receive and costs nothing if the
+# broker is already pushing.
+_CLIENT_TOPIC_PREFIX = "client/"
 
 # Give up after this many non-permanent refusals rather than reconnecting forever.
 _MAX_REFUSALS = 3
@@ -46,6 +60,8 @@ class LocklyMQTTManager:
         self._connected = False
         self._refusals = 0
         self._gave_up = False
+        self._client_id: str | None = None
+        self._last_response: dict | None = None
 
     @property
     def connected(self) -> bool:
@@ -83,14 +99,16 @@ class LocklyMQTTManager:
             return
         # Unique client ID per integration instance; reuse avoids duplicate-session kicks.
         client_id = str(uuid.uuid4()).replace("-", "")
+        self._client_id = client_id
 
         def on_connect(client, userdata, flags, rc):
             if rc == 0:
                 self._connected = True
                 # Logged at info: without it there is no way to tell a working
                 # push connection from one that silently never connected.
-                _LOGGER.info("Lockly MQTT connected, subscribing to %r", _TOPIC)
-                client.subscribe(_TOPIC, qos=0)
+                topic = _CLIENT_TOPIC_PREFIX + client_id
+                _LOGGER.info("Lockly MQTT connected, subscribing to %r", topic)
+                client.subscribe(topic, qos=0)
             else:
                 self._connected = False
                 # rc=5 is "not authorised": a credential problem, not a
@@ -119,20 +137,22 @@ class LocklyMQTTManager:
             # code, not a QoS level.  Reporting it as a confirmation hides the
             # fact that no messages will ever arrive.
             codes = list(granted_qos or [])
+            topic = _CLIENT_TOPIC_PREFIX + client_id
             if any(int(c) == 0x80 for c in codes):
-                _LOGGER.warning(
-                    "Lockly MQTT: broker REFUSED the subscription to %r "
-                    "(SUBACK 0x80) — connected, but no push messages will "
-                    "arrive; state falls back to polling",
-                    _TOPIC,
+                # Not fatal any more. The broker was observed delivering a reply
+                # on this topic without any subscription being granted, so a
+                # refusal here does not mean nothing will arrive. Dropping the
+                # session on it — which this used to do — would throw away a
+                # connection that works.
+                _LOGGER.info(
+                    "Lockly MQTT: subscription to %r was refused (SUBACK 0x80), "
+                    "keeping the connection: the broker pushes to this topic "
+                    "regardless",
+                    topic,
                 )
-                # Holding the session open achieves nothing once the only topic
-                # we want has been refused, so drop it rather than keeping a
-                # pointless connection alive.
-                self._give_up()
             else:
                 _LOGGER.info(
-                    "Lockly MQTT subscribed to %r at qos=%s", _TOPIC, codes
+                    "Lockly MQTT subscribed to %r at qos=%s", topic, codes
                 )
 
         def on_message(client, userdata, msg):
@@ -149,6 +169,23 @@ class LocklyMQTTManager:
                         self._hass.async_create_task,
                         self._process_device_state(data),
                     )
+                elif name == "exception":
+                    # The server reports command failures this way. Worth a
+                    # warning: code 3005 "device is offline" means the hub is
+                    # not connected to this channel, which is the difference
+                    # between a working command path and a silent one.
+                    payload = data.get("payload") or {}
+                    _LOGGER.warning(
+                        "Lockly MQTT: server returned an exception — code=%s %s",
+                        payload.get("code"), payload.get("message"),
+                    )
+                    self._last_response = data
+                elif name == "lockCommandResponse":
+                    _LOGGER.info(
+                        "Lockly MQTT: lock command acknowledged — %s",
+                        data.get("payload"),
+                    )
+                    self._last_response = data
             except Exception:
                 _LOGGER.exception("Lockly MQTT message parse error")
 
@@ -247,6 +284,64 @@ class LocklyMQTTManager:
         """
         await self.async_stop()
         await self.async_start()
+
+    async def async_send_lock_command(self, device_id: str, frame_hex: str) -> bool:
+        """Publish a BLE frame to the lock over MQTT instead of `senddata`.
+
+        A second command transport, independent of the `senddata` REST endpoint.
+        It exists because `senddata` relays through a hub and returns `cod=930`
+        for some accounts while their app still works — the app reaches those
+        locks this way.
+
+        Message shape is from `LockCommandController.sendCommand`, which takes
+        the same `byte[] bleData` this integration already builds for
+        `senddata`, so no new frame construction is involved.
+
+        Returns whether the broker accepted the publish, which is *not* the same
+        as the lock acting on it. The server answers asynchronously on the client
+        topic: `lockCommandResponse` on success, or `exception` with a code, and
+        `3005 device is offline` means the hub is not connected to this channel.
+        """
+        client = self._client
+        if client is None or not self._connected:
+            _LOGGER.debug(
+                "Lockly MQTT: not connected, cannot publish a command for %s",
+                device_id,
+            )
+            return False
+
+        envelope = {
+            "header": {
+                "namespace": "com.lockly",
+                "name": "lockCommandRequest",
+                "requestId": str(uuid.uuid4()),
+                "timestamp": int(time.time() * 1000),
+            },
+            "payload": {
+                "deviceId": device_id,
+                # "forward" is LockCommandRequestData.COMMAND_NAME: the server
+                # forwards the frame to the lock rather than interpreting it.
+                "commandName": "forward",
+                "commandContent": base64.b64encode(bytes.fromhex(frame_hex)).decode(),
+            },
+        }
+        self._last_response = None
+        try:
+            info = await self._hass.async_add_executor_job(
+                lambda: client.publish(
+                    _PUBLISH_TOPIC, json.dumps(envelope, separators=(",", ":")), qos=1
+                )
+            )
+        except Exception:  # noqa: BLE001 - a publish failure must not break a command
+            _LOGGER.exception("Lockly MQTT: publish failed for %s", device_id)
+            return False
+
+        ok = getattr(info, "rc", 1) == 0
+        _LOGGER.info(
+            "Lockly MQTT: published a lock command for %s (%s)",
+            device_id, "queued" if ok else f"local failure rc={getattr(info, 'rc', '?')}",
+        )
+        return ok
 
     async def _process_device_state(self, data: dict) -> None:
         items = data.get("items") or []
