@@ -1,6 +1,7 @@
 """Lockly MQTT manager — real-time lock state via Lockly Paho broker."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import time
@@ -35,6 +36,10 @@ _CLIENT_TOPIC_PREFIX = "client/"
 # Give up after this many non-permanent refusals rather than reconnecting forever.
 _MAX_REFUSALS = 3
 
+# How long to wait for the lock to answer a frame relayed over the broker.
+# Observed round trips are under two seconds; this allows for a sleeping lock.
+_RESPONSE_TIMEOUT = 20.0
+
 # Client-certificate material for the broker, taken from res/raw of the Lockly
 # app (3.2.9): R.raw.ca, R.raw.client and R.raw.client_key, the three files
 # MqttSSLSocketFactory loads.  They are shipped in every copy of the app, so
@@ -61,7 +66,8 @@ class LocklyMQTTManager:
         self._refusals = 0
         self._gave_up = False
         self._client_id: str | None = None
-        self._last_response: dict | None = None
+        # requestId -> future awaiting that exchange's lockCommandResponse.
+        self._pending: dict[str, asyncio.Future] = {}
 
     @property
     def connected(self) -> bool:
@@ -83,6 +89,26 @@ class LocklyMQTTManager:
             client.disconnect()
         except Exception:  # noqa: BLE001 - teardown must not raise
             _LOGGER.debug("Lockly MQTT: error while stopping the client", exc_info=True)
+
+    def _resolve(self, request_id: str | None, payload: dict) -> None:
+        """Hand a reply to whoever is awaiting it.
+
+        Called from the paho thread, so the future is resolved on the event loop
+        rather than directly. The broker sends each reply more than once — every
+        observed exchange arrived twice — so a second delivery for a future that
+        is already done is dropped rather than raising InvalidStateError.
+        """
+        if not request_id:
+            return
+        future = self._pending.get(request_id)
+        if future is None:
+            return
+
+        def _set() -> None:
+            if not future.done():
+                future.set_result(payload)
+
+        self._hass.loop.call_soon_threadsafe(_set)
 
     async def async_start(self) -> None:
         jwt = self._coordinator.jwt
@@ -169,23 +195,21 @@ class LocklyMQTTManager:
                         self._hass.async_create_task,
                         self._process_device_state(data),
                     )
-                elif name == "exception":
-                    # The server reports command failures this way. Worth a
-                    # warning: code 3005 "device is offline" means the hub is
-                    # not connected to this channel, which is the difference
-                    # between a working command path and a silent one.
+                elif name in ("lockCommandResponse", "exception"):
+                    header = data.get("header") or {}
                     payload = data.get("payload") or {}
-                    _LOGGER.warning(
-                        "Lockly MQTT: server returned an exception — code=%s %s",
-                        payload.get("code"), payload.get("message"),
-                    )
-                    self._last_response = data
-                elif name == "lockCommandResponse":
-                    _LOGGER.info(
-                        "Lockly MQTT: lock command acknowledged — %s",
-                        data.get("payload"),
-                    )
-                    self._last_response = data
+                    if name == "exception":
+                        # The server reports delivery failures this way. Code
+                        # 3005 "device is offline" means the hub is not on this
+                        # channel, which is the difference between a working
+                        # command path and a silent one.
+                        _LOGGER.warning(
+                            "Lockly MQTT: server returned an exception — code=%s %s",
+                            payload.get("code"), payload.get("message"),
+                        )
+                        payload = {"code": payload.get("code") or -1,
+                                   "errorMessage": payload.get("message")}
+                    self._resolve(header.get("requestId"), payload)
             except Exception:
                 _LOGGER.exception("Lockly MQTT message parse error")
 
@@ -285,36 +309,40 @@ class LocklyMQTTManager:
         await self.async_stop()
         await self.async_start()
 
-    async def async_send_lock_command(self, device_id: str, frame_hex: str) -> bool:
-        """Publish a BLE frame to the lock over MQTT instead of `senddata`.
+    async def async_exchange_frame(
+        self, device_id: str, frame_hex: str, timeout: float = _RESPONSE_TIMEOUT
+    ) -> str | None:
+        """Send a BLE frame over MQTT and return the lock's ACK as hex.
 
-        A second command transport, independent of the `senddata` REST endpoint.
-        It exists because `senddata` relays through a hub and returns `cod=930`
-        for some accounts while their app still works — the app reaches those
-        locks this way.
+        The broker relays the frame to the lock and returns whatever the lock
+        answered, so this carries *any* frame this integration builds, not only
+        lock and unlock: a status query for the nonce, or a credential query for
+        the host password, work the same way. That matters for accounts where
+        `senddata` refuses everything with cod=930, because without it a command
+        would be built from a stale nonce and the cloud's copy of the password,
+        and the lock rejects that.
 
-        Message shape is from `LockCommandController.sendCommand`, which takes
-        the same `byte[] bleData` this integration already builds for
-        `senddata`, so no new frame construction is involved.
-
-        Returns whether the broker accepted the publish, which is *not* the same
-        as the lock acting on it. The server answers asynchronously on the client
-        topic: `lockCommandResponse` on success, or `exception` with a code, and
-        `3005 device is offline` means the hub is not connected to this channel.
+        Returns the ACK hex, or None if the publish failed, nothing answered in
+        time, or the server reported a delivery error. A returned ACK is the
+        lock's own reply and may still be a rejection — the caller parses it.
         """
         client = self._client
         if client is None or not self._connected:
             _LOGGER.debug(
-                "Lockly MQTT: not connected, cannot publish a command for %s",
-                device_id,
+                "Lockly MQTT: not connected, cannot exchange a frame for %s", device_id
             )
-            return False
+            return None
+
+        request_id = str(uuid.uuid4())
+        loop = self._hass.loop
+        future: asyncio.Future = loop.create_future()
+        self._pending[request_id] = future
 
         envelope = {
             "header": {
                 "namespace": "com.lockly",
                 "name": "lockCommandRequest",
-                "requestId": str(uuid.uuid4()),
+                "requestId": request_id,
                 "timestamp": int(time.time() * 1000),
             },
             "payload": {
@@ -325,23 +353,54 @@ class LocklyMQTTManager:
                 "commandContent": base64.b64encode(bytes.fromhex(frame_hex)).decode(),
             },
         }
-        self._last_response = None
         try:
             info = await self._hass.async_add_executor_job(
                 lambda: client.publish(
                     _PUBLISH_TOPIC, json.dumps(envelope, separators=(",", ":")), qos=1
                 )
             )
-        except Exception:  # noqa: BLE001 - a publish failure must not break a command
-            _LOGGER.exception("Lockly MQTT: publish failed for %s", device_id)
-            return False
+            if getattr(info, "rc", 1) != 0:
+                _LOGGER.warning(
+                    "Lockly MQTT: publish failed locally for %s (rc=%s)",
+                    device_id, getattr(info, "rc", "?"),
+                )
+                return None
+            payload = await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "Lockly MQTT: no reply within %.0fs for %s", timeout, device_id
+            )
+            return None
+        except Exception:  # noqa: BLE001 - an exchange failure must not break a command
+            _LOGGER.exception("Lockly MQTT: exchange failed for %s", device_id)
+            return None
+        finally:
+            self._pending.pop(request_id, None)
 
-        ok = getattr(info, "rc", 1) == 0
-        _LOGGER.info(
-            "Lockly MQTT: published a lock command for %s (%s)",
-            device_id, "queued" if ok else f"local failure rc={getattr(info, 'rc', '?')}",
-        )
-        return ok
+        # code 0 means the *server* delivered it. The lock's own verdict is
+        # inside commandContent, so this is not success on its own — reporting
+        # it as such once made a rejected command look like it had worked.
+        code = payload.get("code")
+        if code not in (0, "0", None):
+            _LOGGER.warning(
+                "Lockly MQTT: server rejected the command for %s — code=%s %s",
+                device_id, code, payload.get("errorMessage"),
+            )
+            return None
+
+        content = payload.get("commandContent")
+        if not content:
+            _LOGGER.warning(
+                "Lockly MQTT: reply for %s carried no lock response", device_id
+            )
+            return None
+        try:
+            return base64.b64decode(content).hex().upper()
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning(
+                "Lockly MQTT: reply for %s was not decodable base64", device_id
+            )
+            return None
 
     async def _process_device_state(self, data: dict) -> None:
         items = data.get("items") or []

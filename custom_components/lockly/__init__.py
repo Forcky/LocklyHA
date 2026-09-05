@@ -28,9 +28,14 @@ from .api import (
     api_query_lock_log_paged,
     api_query_passwords,
     build_lock_cmd,
+    build_query_pwd_cmd,
+    build_query_status_cmd,
     build_unlock_cmd,
     api_unlock,
+    dedupe_credentials,
     describe_open_type,
+    parse_ack,
+    parse_pwd_list_ack,
     host_password_from,
 )
 from .capabilities import LockCapabilities, resolve_capabilities
@@ -459,30 +464,115 @@ class LocklyCoordinator(DataUpdateCoordinator):
         # asynchronously on the client topic.
         return await self._try_mqtt_command(lock, nonce, host_pwd, unlock=unlock)
 
+    async def _mqtt_exchange(self, lock: dict, frame_hex: str) -> dict | None:
+        """Relay a frame to the lock over MQTT and parse whatever it answers.
+
+        The reply carries the lock's own ACK, so this serves any frame we build,
+        which is what makes the MQTT path usable for accounts where `senddata`
+        refuses everything: the nonce and the host password can be fetched the
+        same way as the command itself.
+        """
+        mqtt = getattr(self, "_mqtt_manager", None)
+        if mqtt is None or not mqtt.connected:
+            return None
+        ack = await mqtt.async_exchange_frame(lock["ID"], frame_hex)
+        if not ack:
+            return None
+        name = lock.get("na") or lock.get("blename") or lock["ID"]
+        parsed = parse_ack(ack, str(lock["mc"]), lock["ID"])
+        if not parsed:
+            # parse_ack already logs the decoded error byte. Say which lock and
+            # which path, so this is not mistaken for a senddata failure.
+            _LOGGER.warning("Lockly: %s rejected the frame sent over MQTT", name)
+        return parsed or None
+
+    async def _mqtt_nonce(self, lock: dict) -> str | None:
+        """Fetch a fresh nonce over MQTT when the senddata status query fails."""
+        status = await self._mqtt_exchange(
+            lock, build_query_status_cmd(str(lock["mc"]), lock["ID"])
+        )
+        if not status:
+            return None
+        _LOGGER.info(
+            "Lockly: got a status response for %s over MQTT",
+            lock.get("na") or lock.get("blename") or lock["ID"],
+        )
+        self._learn_from_status(lock, status)
+        return status.get("ble_nonce")
+
     async def _try_mqtt_command(
         self, lock: dict, nonce: str | None, host_pwd: str | None, *, unlock: bool
     ) -> bool:
-        """Publish a command over MQTT after senddata refused it.
+        """Send a command over MQTT after senddata refused it.
 
-        Implemented but not verified end to end: on the only hardware available
-        to test, the broker accepts the publish and answers `3005 device is
-        offline`, meaning that hub is not connected to this channel. The frame
-        is the same one senddata carries, so nothing new is being guessed at.
+        Where `senddata` fails with cod=930 it fails for *everything*, including
+        the status query that supplies the nonce and the credential query that
+        supplies the host password. Building a command from a stale nonce and
+        the cloud's copy of the password gets it rejected by the lock, which is
+        what happened on the first hardware to reach this path. So the
+        prerequisites are re-fetched over the same transport before the command
+        is built.
         """
         mqtt = getattr(self, "_mqtt_manager", None)
         if mqtt is None or not mqtt.connected:
             return False
+        name = lock.get("na") or lock.get("blename") or lock["ID"]
+        caps = self._caps_for(lock)
+
+        # Both inputs are re-fetched rather than trusted. Reaching this method
+        # means senddata refused the command, and on those accounts it refuses
+        # the status and credential queries too — so `nonce` here is whatever
+        # was last seen, possibly hours old, and `host_pwd` is the cloud's copy.
+        fresh = await self._mqtt_nonce(lock)
+        if fresh:
+            nonce = fresh
+        if host_pwd is None:
+            host_pwd = self._host_passwords.get(lock["ID"])
+        if host_pwd is None:
+            entries = await self._mqtt_credentials(lock, nonce)
+            if entries is not None:
+                host_pwd = host_password_from(entries)
+                self._host_passwords[lock["ID"]] = host_pwd
+
         builder = build_unlock_cmd if unlock else build_lock_cmd
         frame = builder(
-            str(lock["mc"]), lock["ID"], host_pwd or "", nonce,
-            caps=self._caps_for(lock),
+            str(lock["mc"]), lock["ID"], host_pwd or str(lock.get("hc") or ""), nonce,
+            caps=caps,
         )
         _LOGGER.info(
-            "Lockly: retrying %s for %s over MQTT",
-            "unlock" if unlock else "lock",
-            lock.get("na") or lock.get("blename") or lock["ID"],
+            "Lockly: retrying %s for %s over MQTT", "unlock" if unlock else "lock", name
         )
-        return await mqtt.async_send_lock_command(lock["ID"], frame)
+        # A parsed ACK means the lock accepted it; a rejection returns None and
+        # is already logged with its error byte.
+        parsed = await self._mqtt_exchange(lock, frame)
+        if parsed is None:
+            return False
+        _LOGGER.info(
+            "Lockly: %s over MQTT succeeded for %s", "unlock" if unlock else "lock", name
+        )
+        self._set_optimistic_lock_state(lock["ID"], is_locked=not unlock)
+        return True
+
+    async def _mqtt_credentials(self, lock: dict, nonce: str | None) -> list[dict] | None:
+        """Read the credential list over MQTT, for the host password.
+
+        Only the first page: the host credential lives in slot 0, so paging for
+        the rest would wake the lock repeatedly for data this path does not use.
+        """
+        mqtt = getattr(self, "_mqtt_manager", None)
+        if mqtt is None:
+            return None
+        frame = build_query_pwd_cmd(str(lock["mc"]), lock["ID"], 0, nonce)
+        ack = await mqtt.async_exchange_frame(lock["ID"], frame)
+        if not ack:
+            return None
+        parsed = parse_pwd_list_ack(
+            ack, str(lock["mc"]), lock["ID"],
+            five_hundred_group=self._caps_for(lock).supports_500_group_password,
+        )
+        if parsed is None:
+            return None
+        return dedupe_credentials(parsed.get("entries") or [])
 
     async def async_unlock_lock(self, lock_id: str) -> bool:
         return await self._send_command(lock_id, unlock=True)
