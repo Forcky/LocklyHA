@@ -3,7 +3,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 [![GitHub Release](https://img.shields.io/github/v/release/Forcky/LocklyHA)](https://github.com/Forcky/LocklyHA/releases)
-[![Version](https://img.shields.io/badge/version-0.7.1-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.1)
+[![Version](https://img.shields.io/badge/version-0.7.2-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.2)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Control and monitor your **Lockly smart locks** from Home Assistant. This integration communicates with the Lockly cloud API using the same protocol as the official Lockly mobile app.
@@ -18,6 +18,7 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 |---|---|
 | Unlock from HA | ✅ Verified on PGD628FN + PGH220 hub |
 | Lock from HA | 🚧 Implemented; hard to verify on auto-locking locks |
+| Commands over MQTT when senddata is refused | ✅ Verified on PGD728FN + PGH260 hub (cod=930 accounts) |
 | Lock state (locked / unlocked) | ✅ At startup and after HA commands |
 | Battery low warning | ✅ |
 | Door sensor state (if fitted) | ✅ Verified open and closed on a wired sensor |
@@ -228,8 +229,22 @@ Credentials (email and password) are stored in HA's config entry. The integratio
 
 ## Known Limitations
 
-- **Locks with no PGH hub are not supported.** This covers both Bluetooth-only locks and WiFi-native models such as the `PGD728FG25`, which connect straight to WiFi. The `senddata` endpoint relays commands through a hub, so with an empty `hubid` the cloud returns `cod=930` for both state and commands. The integration now detects this and says so rather than reporting a bare error code. Supporting these locks needs a different API path (tracked in issue #2).
+- **Locks with no PGH hub are not supported.** This covers both Bluetooth-only locks and WiFi-native models such as the `PGD728FG25`, which connect straight to WiFi. The `senddata` endpoint relays commands through a hub, so with an empty `hubid` the cloud returns `cod=930` for both state and commands. The integration now detects this and says so rather than reporting a bare error code. Supporting these locks needs a different API path (tracked in issue #2). The MQTT command transport below is now a working candidate for them: it reaches locks without using `senddata` at all, and is confirmed on an account where every `senddata` call is refused.
 - **Unlock is verified from 0.5.0.** Two fields in the command frame were wrong: the `str3` hub flag was sent as `00` instead of `01`, and the credential slot was sent as `1` instead of `0` (the host credential lives in slot 0). Both had to be right at once, which is why this took so long to find. Confirmed against physical hardware — a PGD628FN on firmware 4.03.15 behind a PGH220 hub.
+- **Commands fall back to MQTT when `senddata` fails, and this is verified.** If
+  your logs are full of `cod=930` while the official Lockly app controls your
+  locks normally, the app is reaching them over Lockly's MQTT broker rather than
+  through `senddata`. The integration now does the same: when a lock or unlock
+  is refused, it fetches a fresh nonce, reads the host password from the lock,
+  and sends the command over the broker, all on that transport.
+
+  Confirmed working from 0.7.1 by a user whose `senddata` calls all return
+  `cod=930` — locking and unlocking both succeed. That account is on a
+  `PGD728FN` behind a `PGH260` hub.
+
+  Note what is *not* yet routed this way: the periodic status query and the
+  access log still go through `senddata`, so on an affected account lock state
+  can be stale even while commands work. That is the next thing to move across.
 - **Silent polling requires hub firmware build ≥ 422** (for major-version-2 hubs). On older firmware `lock/cachedstatus/get` returns `cod=900` and state only updates at startup and after HA commands. Note that Lockly does not necessarily offer an upgrade: a PGH220 on `2.2.04.17` (build 417) reports itself up to date, five builds short of the requirement.
 
 - **Door sensor state is verified, but sensor _presence_ cannot be read from the lock.** Bit 0 of the status byte is the door circuit: `0` = closed, `1` = open. A closed door completes the circuit and an open door breaks it — but a lock with no sensor fitted is an open circuit permanently, so it reads `1` too. That makes `1` ambiguous between "door open" and "no sensor fitted", and this ACK carries no separate presence flag. (The hub's `lock/cachedstatus/get` response does have one, at bit 1, but that endpoint needs newer hub firmware — see above.)

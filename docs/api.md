@@ -975,6 +975,13 @@ and an `exception`/`3005` reply received. So the transport works in both
 directions; whether a *command* succeeds depends on the hub being online on the
 channel. A PGH220 on build 417 is not.
 
+**Verified working.** A user whose `senddata` calls all return `cod=930` can lock
+and unlock from Home Assistant over this channel as of v0.7.1, on a `PGD728FN`
+behind a `PGH260` hub. Note that the command must be built from a nonce and host
+password fetched over the *same* transport: on such an account `senddata` also
+refuses the status and credential queries, and a command built from a stale
+nonce is rejected by the lock with BLE error `F3`.
+
 This makes the MQTT channel a **second command transport** independent of
 `senddata`, which is the likely reason some accounts get `cod=930` from
 `senddata` while their app works normally.
