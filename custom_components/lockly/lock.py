@@ -67,15 +67,21 @@ class LocklyLock(CoordinatorEntity, LockEntity):
         return attrs
 
     async def async_unlock(self, **kwargs: Any) -> None:
-        self.is_unlocking = True
-        self.is_locking = False
-        await self.coordinator.async_unlock_lock(self._lock_id)
-        self.is_unlocking = False
-        self.is_locking = False
+        self._attr_is_locking = False
+        self._attr_is_unlocking = True
+        self.async_write_ha_state()
+        try:
+            await self.coordinator.async_unlock_lock(self._lock_id)
+        finally:
+            self._attr_is_unlocking = False
+            self.async_write_ha_state()
 
     async def async_lock(self, **kwargs: Any) -> None:
-        self.is_locking = True
-        self.is_unlocing = False
-        await self.coordinator.async_lock_lock(self._lock_id)
-        self.is_locking = False
-        self.is_unlocing = False
+        self._attr_is_unlocking = False
+        self._attr_is_locking = True
+        self.async_write_ha_state()
+        try:
+            await self.coordinator.async_lock_lock(self._lock_id)
+        finally:
+            self._attr_is_locking = False
+            self.async_write_ha_state()
