@@ -1,0 +1,7 @@
+# What the test suites need to run. The integration's own runtime dependencies
+# are declared in custom_components/lockly/manifest.json; these are the same two
+# plus Home Assistant itself, because the suites import the integration and it
+# imports HA.
+homeassistant
+pycryptodome>=3.9.0
+paho-mqtt>=1.6.0
