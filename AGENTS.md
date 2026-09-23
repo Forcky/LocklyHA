@@ -55,6 +55,35 @@ confirm it actually completed before treating that as evidence.
 
 ---
 
+## Checks before you push
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull request:
+
+- **ruff**, configured in `ruff.toml` — pycodestyle plus pyflakes, nothing about
+  taste. It exists because three pull requests in one week carried trailing
+  whitespace on a blank line, one of them a PR whose only purpose was removing
+  trailing whitespace. A diff on github.com does not show it.
+- **Both test suites**, `tests/test_frame.py` and `tests/test_exchange.py`. They
+  need no network, no broker and no hardware, so there is no reason not to run
+  them everywhere.
+
+Locally the suites need Home Assistant importable, which is easiest inside the
+container:
+
+```
+docker cp custom_components homeassistant:/tmp/lt/custom_components
+docker cp tests homeassistant:/tmp/lt/tests
+docker exec -w /tmp/lt -e PYTHONPATH=/tmp/lt homeassistant python tests/test_frame.py
+```
+
+Ruff needs nothing installed:
+
+```
+docker run --rm -v "$PWD:/src" -w /src ghcr.io/astral-sh/ruff:latest check
+```
+
+---
+
 ## Architecture
 
 ```

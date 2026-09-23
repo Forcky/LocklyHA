@@ -17,9 +17,7 @@ from Crypto.Cipher import AES
 
 from custom_components.lockly.api import (
     build_lock_cmd,
-    build_query_lock_settings_cmd,
     build_set_auto_lock_cmd,
-    build_set_lock_settings_cmd,
     disable_auto_lock_in_settings,
     enable_auto_lock_in_settings,
     build_paging_log_cmd,

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: check --output-format github
+
+  tests:
+    name: Frame and MQTT checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # The suites import the integration, which imports Home Assistant, so the
+      # real thing is installed rather than stubbed. They need no network, no
+      # broker and no hardware: every frame is asserted against a plaintext
+      # layout, and the MQTT tests drive a fake client.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install homeassistant pycryptodome paho-mqtt
+
+      - name: Frame builders and parsers
+        run: python tests/test_frame.py
+        env:
+          PYTHONPATH: .
+
+      - name: MQTT exchange and state callbacks
+        run: python tests/test_exchange.py
+        env:
+          PYTHONPATH: .

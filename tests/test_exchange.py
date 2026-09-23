@@ -4,7 +4,11 @@ The parts most likely to be subtly wrong are threaded: replies arrive on the
 paho thread, every observed reply arrived twice, and a second delivery for an
 already-resolved future would raise InvalidStateError.
 """
-import asyncio, base64, json, sys, threading
+import asyncio
+import base64
+import json
+import sys
+import threading
 sys.path.insert(0, "/config/lockly_test")  # set by the deploy step; see AGENTS.md
 
 from custom_components.lockly.mqtt import LocklyMQTTManager, _truncate

@@ -844,7 +844,7 @@ class LocklyCoordinator(DataUpdateCoordinator):
             self.async_set_updated_data(updated)
 
     def _get_lock(self, lock_id: str) -> dict | None:
-        return next((l for l in self.locks if l["ID"] == lock_id), None)
+        return next((entry for entry in self.locks if entry["ID"] == lock_id), None)
 
     def async_start_history_polling(self) -> None:
         """Register the access log poll timer and do one fetch shortly after setup.

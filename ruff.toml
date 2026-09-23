@@ -1,0 +1,19 @@
+# Lint rules for LocklyHA.
+#
+# The point of this file is narrow: three pull requests in one week carried
+# trailing whitespace on an otherwise blank line, and one of them was a PR whose
+# only purpose was to remove trailing whitespace. Nothing in review catches that
+# reliably, and a human reading a diff on github.com cannot see it at all.
+#
+# So the selection is deliberately small — pycodestyle errors and warnings, and
+# pyflakes. It catches whitespace, indentation, unused imports and undefined
+# names, and it stays quiet about everything that is a matter of taste. Anyone
+# is free to widen it later; it is not meant as a style opinion.
+line-length = 120
+
+[lint]
+select = ["E", "W", "F"]
+
+[lint.per-file-ignores]
+# The test scripts run standalone rather than under pytest, and print as they go.
+"tests/*" = ["E402"]
