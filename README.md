@@ -3,7 +3,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 [![GitHub Release](https://img.shields.io/github/v/release/Forcky/LocklyHA)](https://github.com/Forcky/LocklyHA/releases)
-[![Version](https://img.shields.io/badge/version-0.7.9-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.9)
+[![Version](https://img.shields.io/badge/version-0.7.10-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.10)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Control and monitor your **Lockly smart locks** from Home Assistant. This integration communicates with the Lockly cloud API using the same protocol as the official Lockly mobile app.
@@ -24,7 +24,7 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 | Hubless WiFi-native locks | ✅ Verified from 0.7.4 on two PGK728WRHK (Lockly Visage), firmware 1.14.31 and 3.00.24 |
 | Lock state (locked / unlocked) | ✅ At startup and after HA commands |
 | Battery low warning | ✅ |
-| Door sensor state (if fitted) | ✅ Verified open and closed on a wired sensor |
+| Door sensor state (if fitted) | ✅ Verified open and closed on a wired sensor; on-demand refresh service from 0.7.10 |
 | Last access / who entered | ✅ Read from the lock; names resolve unless a slot is shared |
 | Guest PIN management (add / remove / list) | 🚧 In progress |
 | Real-time push of external (keypad / app) lock changes | ✅ On WiFi-native locks from 0.7.6 · ⛔ On hub locks — needs an FCM token HA cannot obtain |
@@ -130,6 +130,26 @@ Results are returned as the bus events `lockly_native_auto_lock_enabled` and
 
 Enabling while the door is already closed and unlocked does **not** lock it.
 Automation acts on the next door-close transition, not on the current state.
+
+### Refresh door state on demand
+
+The door sensor updates when the lock is commanded and, on WiFi-native locks,
+when the lock pushes a state callback. Neither covers a door that opens and
+closes without the lock being touched, and at least one model does not push
+magnet state at all. This service asks the lock directly.
+
+| Service | Required fields |
+|---|---|
+| `lockly.refresh_door_state` | `lock_id` |
+
+The answer lands on the door entity and on a `lockly_door_state_refreshed`
+event carrying `lock_id` and `door_open`, so an automation can wait for the
+reading it asked for. `door_open: null` means the lock did not answer, which is
+not the same as a closed door.
+
+> **This wakes the lock.** It sends a real Bluetooth status frame, so the lock
+> may chirp — call it when you need a current reading, not on a timer. It is
+> MQTT-only: a hub-relayed lock cannot answer it.
 
 ---
 
