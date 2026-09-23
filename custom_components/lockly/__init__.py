@@ -675,6 +675,31 @@ class LocklyCoordinator(DataUpdateCoordinator):
     async def async_disable_native_auto_lock(self, lock_id: str) -> bool:
         """Disable lock-resident Auto-Lock."""
         return await self._async_set_native_auto_lock(lock_id, False)
+
+    async def async_refresh_door_state(self, lock_id: str) -> bool | None:
+        """Query the lock and return its freshly measured door state.
+
+        This sends a real BLE status frame and wakes the lock, so it belongs in
+        an on-demand service and must not be used on a frequent timer.
+        """
+        lock = self._get_lock(lock_id)
+        if lock is None:
+            return None
+
+        status = await self._mqtt_exchange(
+            lock, build_query_status_cmd(str(lock["mc"]), lock["ID"])
+        )
+        if not status:
+            return None
+
+        _LOGGER.info(
+            "Lockly: got an on-demand door status response for %s over MQTT",
+            lock.get("na") or lock.get("blename") or lock["ID"],
+        )
+        self._learn_from_status(lock, status)
+        self._publish_status(lock, status)
+        return status.get("door_sensor_open")
+
     async def _try_mqtt_command(
         self, lock: dict, nonce: str | None, host_pwd: str | None, *, unlock: bool
     ) -> bool:
@@ -1253,6 +1278,20 @@ def _register_services(hass: HomeAssistant, coordinator: LocklyCoordinator) -> N
             ),
         })
 
+    async def handle_refresh_door_state(call) -> None:
+        """Request a fresh physical door-sensor reading over MQTT."""
+        lock_id = call.data["lock_id"]
+        door_open = await coordinator.async_refresh_door_state(lock_id)
+        _LOGGER.info(
+            "Lockly: on-demand door refresh for %s returned door_open=%s",
+            lock_id,
+            door_open,
+        )
+        hass.bus.async_fire("lockly_door_state_refreshed", {
+            "lock_id": lock_id,
+            "door_open": door_open,
+        })
+
     async def handle_enable_native_auto_lock(call) -> None:
         """Enable the lock's own close-door-immediately locking behavior."""
         lock_id = call.data["lock_id"]
@@ -1302,6 +1341,13 @@ def _register_services(hass: HomeAssistant, coordinator: LocklyCoordinator) -> N
             locks = [one]
         for lock in locks:
             await coordinator.async_read_signal(lock)
+
+    hass.services.async_register(
+        DOMAIN,
+        "refresh_door_state",
+        handle_refresh_door_state,
+        schema=_LIST_GUESTS_SCHEMA,
+    )
 
     hass.services.async_register(
         DOMAIN,

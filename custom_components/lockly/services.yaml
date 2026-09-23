@@ -171,3 +171,18 @@ read_signal:
       required: false
       selector:
         text:
+
+refresh_door_state:
+  name: Refresh door state
+  description: >
+    Ask the lock for a fresh door-sensor reading and publish it to the door
+    entity. This wakes the lock over Bluetooth, so the lock may chirp — call it
+    when you need a current reading, not on a schedule. MQTT-only: a
+    hub-relayed lock cannot answer it.
+  fields:
+    lock_id:
+      name: Lock ID
+      description: Device UUID of the lock to query.
+      required: true
+      selector:
+        text:
