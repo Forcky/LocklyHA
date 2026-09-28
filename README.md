@@ -3,7 +3,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 [![GitHub Release](https://img.shields.io/github/v/release/Forcky/LocklyHA)](https://github.com/Forcky/LocklyHA/releases)
-[![Version](https://img.shields.io/badge/version-0.7.11-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.11)
+[![Version](https://img.shields.io/badge/version-0.7.12-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.12)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Control and monitor your **Lockly smart locks** from Home Assistant. This integration communicates with the Lockly cloud API using the same protocol as the official Lockly mobile app.
@@ -107,6 +107,14 @@ Three HA services are available for managing time-limited guest PIN codes. Call 
 Results are returned as HA bus events: `lockly_guest_list`, `lockly_guest_added`, `lockly_guest_deleted`. Listen for these in **Developer Tools → Events**.
 
 `lock_id` is the device UUID (visible on the lock's device page in HA under *Identifiers*).
+
+> **Quote it in YAML.** Plenty of Lockly IDs are all digits — `250021003033471231363531` — and Home Assistant's YAML editor has no integer type wide enough to hold one. Unquoted, it is rounded to something like `2.5002100303347123e+23` before the integration ever sees it, and the original digits cannot be recovered. The service then matches no lock. From 0.7.12 this is reported as an error naming the problem instead of failing silently, but quoting the ID avoids it entirely:
+>
+> ```yaml
+> action: lockly.refresh_door_state
+> data:
+>   lock_id: "250021003033471231363531"
+> ```
 
 ### Native Auto-Lock (Automation)
 

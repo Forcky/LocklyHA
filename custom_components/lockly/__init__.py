@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -70,6 +71,19 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+# A lock id that has been through a floating-point number and come back wrong.
+#
+# Lockly device ids are long runs of hex, and plenty of them are all digits.
+# Home Assistant's YAML editor parses one in JavaScript, which has no integer
+# type wide enough, so an unquoted id above 2**53 arrives as
+# 2.5002100303347123e+23 — the digits are gone before any of this code runs and
+# nothing can recover them. All that is left is to recognise the shape and say
+# so, because the bare symptom is a service that quietly matches no lock.
+#
+# The dot is what makes this safe to match on: a real id never contains one.
+_MANGLED_ID = re.compile(r"^\d+\.\d+([eE][+-]?\d+)?$")
 
 
 def _rate_rssi(rssi: int | None) -> str:
@@ -869,7 +883,18 @@ class LocklyCoordinator(DataUpdateCoordinator):
             self.async_set_updated_data(updated)
 
     def _get_lock(self, lock_id: str) -> dict | None:
-        return next((entry for entry in self.locks if entry["ID"] == lock_id), None)
+        lock = next((entry for entry in self.locks if entry["ID"] == lock_id), None)
+        if lock is None and _MANGLED_ID.match(str(lock_id).strip()):
+            _LOGGER.error(
+                "Lockly: lock_id arrived as the number %s rather than an id. A "
+                "lock id made only of digits has to be quoted in YAML — "
+                'lock_id: "123…" — because Home Assistant\'s editor cannot hold '
+                "one that long and rounds it off before this integration sees "
+                "it. The original digits are gone by then; copy the id from the "
+                "lock's device page and quote it",
+                lock_id,
+            )
+        return lock
 
     def async_start_history_polling(self) -> None:
         """Register the access log poll timer and do one fetch shortly after setup.

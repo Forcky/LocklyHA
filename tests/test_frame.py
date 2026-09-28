@@ -36,7 +36,7 @@ from custom_components.lockly.api import (
     parse_log_ack,
     parse_pwd_list_ack,
 )
-from custom_components.lockly import LocklyCoordinator
+from custom_components.lockly import _MANGLED_ID, LocklyCoordinator
 from custom_components.lockly.capabilities import (
     LockCapabilities,
     resolve_capabilities,
@@ -191,6 +191,22 @@ def test_ack_parse_real_capture() -> None:
     volts = (parsed.get("wakeup_voltage") or 0) / 100
     check("battery voltage plausible for 4xAA", 3.5 < volts < 6.6, True)
     print(f"       lock_type={parsed.get('lock_type')} wakeup={volts:.2f}V")
+
+
+def test_mangled_lock_id_is_recognised() -> None:
+    """A lock id that has been through a float is detected, a real one is not.
+
+    Home Assistant's YAML editor rounds an unquoted all-digit id above 2**53,
+    so the digits are gone before the integration runs. Reported on #10.
+    """
+    print("mangled lock id")
+    check("scientific notation", bool(_MANGLED_ID.match("2.5002100303347123e+23")), True)
+    check("plain decimal", bool(_MANGLED_ID.match("250021003033471.5")), True)
+    # The dot is what makes this safe: no real id has one, including ids that
+    # are all digits and ids whose hex happens to end in something like "e1".
+    check("an all-digit id", bool(_MANGLED_ID.match("250021003033471231363531")), False)
+    check("a hex id", bool(_MANGLED_ID.match("2d0023003030471333363838")), False)
+    check("a hex id ending in e1", bool(_MANGLED_ID.match("250021003033471231363e1")), False)
 
 
 def test_capabilities() -> None:
@@ -570,6 +586,7 @@ def main() -> int:
         test_22_cmd_type_byte_unchanged,
         test_status_frame_unchanged,
         test_ack_parse_real_capture,
+        test_mangled_lock_id_is_recognised,
         test_capabilities,
         test_native_auto_lock_frames,
         test_query_pwd_frame,

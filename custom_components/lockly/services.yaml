@@ -9,7 +9,7 @@ enable_native_auto_lock:
   fields:
     lock_id:
       name: Lock ID
-      description: The Lockly lock ID (device UUID) to configure.
+      description: The Lockly lock ID (device UUID) to configure. Quote it in YAML — an all-digit ID is otherwise read as a number and rounded off.
       required: true
       selector:
         text:
@@ -22,7 +22,7 @@ disable_native_auto_lock:
   fields:
     lock_id:
       name: Lock ID
-      description: The Lockly lock ID (device UUID) to configure.
+      description: The Lockly lock ID (device UUID) to configure. Quote it in YAML — an all-digit ID is otherwise read as a number and rounded off.
       required: true
       selector:
         text:
@@ -35,7 +35,7 @@ list_guests:
   fields:
     lock_id:
       name: Lock ID
-      description: The Lockly lock ID (lockId) to query.
+      description: The Lockly lock ID (lockId) to query. Quote it in YAML — an all-digit ID is otherwise read as a number and rounded off.
       required: true
       example: "ABC123"
       selector:
@@ -49,7 +49,7 @@ add_guest:
   fields:
     lock_id:
       name: Lock ID
-      description: The Lockly lock ID (lockId) to modify.
+      description: The Lockly lock ID (lockId) to modify. Quote it in YAML — an all-digit ID is otherwise read as a number and rounded off.
       required: true
       example: "ABC123"
       selector:
@@ -106,7 +106,7 @@ delete_guest:
   fields:
     lock_id:
       name: Lock ID
-      description: The Lockly lock ID (lockId) to modify.
+      description: The Lockly lock ID (lockId) to modify. Quote it in YAML — an all-digit ID is otherwise read as a number and rounded off.
       required: true
       example: "ABC123"
       selector:
@@ -133,7 +133,7 @@ query_passwords:
   fields:
     lock_id:
       name: Lock ID
-      description: The lock's device UUID (the ID field, 24 hex characters).
+      description: The lock's device UUID (the ID field, 24 hex characters). Quote it in YAML — an all-digit ID is otherwise read as a number and rounded off.
       required: true
       example: "300021003131471535373831"
       selector:
@@ -149,7 +149,7 @@ read_access_log:
   fields:
     lock_id:
       name: Lock ID
-      description: The lock's device UUID (the ID field, 24 hex characters).
+      description: The lock's device UUID (the ID field, 24 hex characters). Quote it in YAML — an all-digit ID is otherwise read as a number and rounded off.
       required: true
       example: "280033003131470432353835"
       selector:
@@ -167,7 +167,7 @@ read_signal:
   fields:
     lock_id:
       name: Lock ID
-      description: Device UUID of one lock. Omit to read every lock.
+      description: Device UUID of one lock. Omit to read every lock. Quote it in YAML — an all-digit ID is otherwise read as a number and rounded off.
       required: false
       selector:
         text:
@@ -182,7 +182,7 @@ refresh_door_state:
   fields:
     lock_id:
       name: Lock ID
-      description: Device UUID of the lock to query.
+      description: Device UUID of the lock to query. Quote it in YAML — an all-digit ID is otherwise read as a number and rounded off.
       required: true
       selector:
         text:

@@ -1537,3 +1537,28 @@ PGK728WRHK/type 105 was validated on firmware 3.00.24 and 1.14.31. A physical
 OFF-to-ON test read settings `0x02`, enabled Automation, and independently read
 back `0x0A`. With the door left open for more than 30 seconds the deadbolt
 remained retracted; closing the door then locked immediately.
+
+### The app's toggle is not the lock's state
+
+The Lockly app's Auto-Detection switch can disagree with what the lock is
+actually doing, which matters because a lock throwing its bolt against an open
+door looks like a fault in whatever software touched it last. Reported on
+[#10](https://github.com/Forcky/LocklyHA/issues/10) and quoted with permission:
+
+> On my PGK728WRHK hardware, a settings value of 0x0A corresponded with the
+> lock performing its native automatic locking behavior even when the Lockly
+> app showed Auto-Detection as off. Changing the settings value from 0x0A to
+> 0x02 stopped that native automatic locking behavior.
+>
+> — Brian Salyer (@Dei381rcr)
+
+That is `0x08` set in the settings byte, which is the master switch described
+above, so the lock was enforcing exactly what its own byte said while the app
+displayed something else. The reporter asked that this stay scoped to the
+PGK728WRHK hardware he tested rather than be assumed for every model, and that
+is the right caution: nothing here establishes how other models behave.
+
+The practical consequence is that `lockly.disable_native_auto_lock` is the way
+to be certain, because it reads the byte, clears the one bit and reads it back,
+rather than trusting a display. It is also why the write is a read-modify-write
+and not a blind set — the bit's real state is the only thing worth acting on.
