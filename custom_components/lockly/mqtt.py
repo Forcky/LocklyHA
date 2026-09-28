@@ -36,15 +36,18 @@ _CLIENT_TOPIC_PREFIX = "client/"
 # Give up after this many non-permanent refusals rather than reconnecting forever.
 _MAX_REFUSALS = 3
 
-# Values a deviceStateCallback carries for the two states this reads. The word
-# forms for the lock are what a Visage actually sends, captured on issue #5; the
-# numeric ones are what the APK's own constants describe. The magnet word forms
-# are defensive — no lock has been seen sending one, because these locks push no
-# magnet state at all — so they are a guess at shape, not an observation.
+# Values a deviceStateCallback carries for the states this reads. The word forms
+# are what a Visage actually sends, captured on issues #5 and #10; the numeric
+# ones are what the APK's own constants describe.
+#
+# `opened` was the expensive one. This set said `open`, so a door closing was
+# recorded and a door opening was not — the sensor could go to closed and never
+# back. It was reported as missed callbacks before anyone read the warning the
+# unrecognised value was already logging.
 _LOCKED_TRUE = frozenset({"1", "true", "locked"})
 _LOCKED_FALSE = frozenset({"0", "false", "unlocked"})
-_MAGNET_TRUE = frozenset({"1", "true", "open"})
-_MAGNET_FALSE = frozenset({"0", "false", "closed"})
+_MAGNET_TRUE = frozenset({"1", "true", "open", "opened"})
+_MAGNET_FALSE = frozenset({"0", "false", "close", "closed"})
 
 
 def _as_bool(raw: object, true_set: frozenset, false_set: frozenset) -> bool | None:
@@ -55,6 +58,20 @@ def _as_bool(raw: object, true_set: frozenset, false_set: frozenset) -> bool | N
     if value in false_set:
         return False
     return None
+
+
+def _as_percent(raw: object) -> int | None:
+    """Read a battery percentage, or None when the value is not one.
+
+    Anything outside 0-100 is refused rather than clamped. A lock reporting 255
+    is saying something other than "full", and people set low-battery alerts off
+    this number, so a wrong one is worse than none.
+    """
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if 0 <= value <= 100 else None
 
 
 # How much of a raw broker message the debug log keeps. This was 400, which cut
@@ -525,6 +542,9 @@ class LocklyMQTTManager:
                 elif name == "magnet":
                     value = _as_bool(raw, _MAGNET_TRUE, _MAGNET_FALSE)
                     field = "door_sensor_open"
+                elif name == "battery":
+                    value = _as_percent(raw)
+                    field = "battery_percent"
                 else:
                     continue
                 if value is None:

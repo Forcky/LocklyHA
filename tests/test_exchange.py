@@ -151,6 +151,46 @@ async def main():
     await m._process_device_state(state_msg("payload", "2D0023", {"lock": "unlocked"}))
     check("uppercase id matches our lowercase key", coord.data["2d0023"]["is_locked"], False)
 
+    # The magnet value a Visage actually sends is "opened", not "open". This set
+    # held only "open", so a door closing was recorded and a door opening was
+    # dropped — the sensor could reach closed and never leave it. Captured on #10.
+    print("device state: magnet word forms")
+    for value, expected in (("opened", True), ("closed", False), ("OPENED", True)):
+        coord = FakeCoordinator({"dev1": {}})
+        m._coordinator = coord
+        await m._process_device_state(state_msg("payload", "dev1", {"magnet": value}))
+        check(f"magnet={value!r} reads door_open={expected}",
+              coord.data["dev1"].get("door_sensor_open"), expected)
+
+    print("device state: battery percentage")
+    coord = FakeCoordinator({"dev1": {}})
+    m._coordinator = coord
+    await m._process_device_state(state_msg("payload", "dev1", {"battery": "100"}))
+    check("a percentage is published", coord.data["dev1"]["battery_percent"], 100)
+
+    coord = FakeCoordinator({"dev1": {"battery_percent": 80}})
+    m._coordinator = coord
+    await m._process_device_state(state_msg("payload", "dev1", {"battery": "255"}))
+    check("an impossible percentage is refused, not clamped",
+          coord.data["dev1"]["battery_percent"], 80)
+    check("and nothing is published", coord.writes, 0)
+
+    coord = FakeCoordinator({"dev1": {"battery_percent": 80}})
+    m._coordinator = coord
+    await m._process_device_state(state_msg("payload", "dev1", {"battery": "unknown"}))
+    check("so is a non-numeric one", coord.data["dev1"]["battery_percent"], 80)
+
+    print("device state: one callback carrying everything")
+    coord = FakeCoordinator({"dev1": {}})
+    m._coordinator = coord
+    await m._process_device_state(state_msg(
+        "payload", "dev1", {"lock": "unlocked", "magnet": "opened", "battery": "95"}
+    ))
+    check("lock applied", coord.data["dev1"]["is_locked"], False)
+    check("door applied", coord.data["dev1"]["door_sensor_open"], True)
+    check("battery applied", coord.data["dev1"]["battery_percent"], 95)
+    check("published once for the batch", coord.writes, 1)
+
     # The debug log is how every protocol question on this repo has been
     # answered, so a payload that fits must arrive whole.
     print("debug log truncation")

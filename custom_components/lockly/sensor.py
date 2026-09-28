@@ -61,9 +61,11 @@ def _lock_display_name(lock_data: dict, lock_id: str) -> str:
 class LocklyBatterySensor(CoordinatorEntity, SensorEntity):
     """Battery level for a Lockly lock.
 
-    Uses the wakeup_voltage from the live BLE query (one-time at startup) for a
-    real percentage.  Falls back to 10 % / 90 % sentinels when only the binary
-    low-battery flag is available (cloud cache or invalid voltage reading).
+    Three sources, in descending order of how much they can be trusted: the
+    percentage the lock pushes on the MQTT channel, the wakeup_voltage from a
+    live BLE query run through our own curve, and the binary low/normal flag
+    from the cloud cache expressed as 10 % / 90 % sentinels. The `source`
+    attribute says which one produced the current reading.
     """
 
     _attr_has_entity_name = True
@@ -92,6 +94,13 @@ class LocklyBatterySensor(CoordinatorEntity, SensorEntity):
     def native_value(self) -> int | None:
         d = self._lock_data
 
+        # The lock's own number, pushed on the MQTT channel. It outranks the
+        # voltage curve below because it is the figure the lock and the Lockly
+        # app agree on rather than an inference from a wakeup reading.
+        pct = d.get("battery_percent")
+        if pct is not None:
+            return pct
+
         # Real voltage — present after a live BLE query (startup or post-command).
         raw_v = d.get("wakeup_voltage")
         if raw_v is not None and not d.get("battery_invalid"):
@@ -107,6 +116,15 @@ class LocklyBatterySensor(CoordinatorEntity, SensorEntity):
     def extra_state_attributes(self) -> dict:
         d = self._lock_data
         attrs: dict = {}
+        # Which source produced the reading. 90 % from a sentinel and 90 %
+        # measured mean very different things to someone setting a low-battery
+        # alert, and nothing else on the entity distinguishes them.
+        if d.get("battery_percent") is not None:
+            attrs["source"] = "reported"
+        elif d.get("wakeup_voltage") is not None and not d.get("battery_invalid"):
+            attrs["source"] = "voltage"
+        elif d.get("low_battery") is not None:
+            attrs["source"] = "low battery flag"
         raw_v = d.get("wakeup_voltage")
         if raw_v is not None:
             attrs["voltage"] = round(raw_v * 0.01, 2)

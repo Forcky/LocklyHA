@@ -3,7 +3,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 [![GitHub Release](https://img.shields.io/github/v/release/Forcky/LocklyHA)](https://github.com/Forcky/LocklyHA/releases)
-[![Version](https://img.shields.io/badge/version-0.7.10-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.10)
+[![Version](https://img.shields.io/badge/version-0.7.11-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.11)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Control and monitor your **Lockly smart locks** from Home Assistant. This integration communicates with the Lockly cloud API using the same protocol as the official Lockly mobile app.
@@ -23,7 +23,7 @@ Control and monitor your **Lockly smart locks** from Home Assistant. This integr
 | Native Auto-Lock (Automation), set on the lock | ✅ From 0.7.8 on PGK728WRHK; MQTT-only |
 | Hubless WiFi-native locks | ✅ Verified from 0.7.4 on two PGK728WRHK (Lockly Visage), firmware 1.14.31 and 3.00.24 |
 | Lock state (locked / unlocked) | ✅ At startup and after HA commands |
-| Battery low warning | ✅ |
+| Battery level | ✅ Real percentage on WiFi-native locks from 0.7.11; low/normal sentinels elsewhere |
 | Door sensor state (if fitted) | ✅ Verified open and closed on a wired sensor; on-demand refresh service from 0.7.10 |
 | Last access / who entered | ✅ Read from the lock; names resolve unless a slot is shared |
 | Guest PIN management (add / remove / list) | 🚧 In progress |
@@ -133,10 +133,11 @@ Automation acts on the next door-close transition, not on the current state.
 
 ### Refresh door state on demand
 
-The door sensor updates when the lock is commanded and, on WiFi-native locks,
-when the lock pushes a state callback. Neither covers a door that opens and
-closes without the lock being touched, and at least one model does not push
-magnet state at all. This service asks the lock directly.
+The door sensor updates when the lock is commanded, and when something asks the
+lock directly. It does not update when the door moves: a WiFi-native lock knows
+its own `magnet` state and reports it accurately when queried, but never pushes
+the change. Opening and closing a door by hand, with no query running, produces
+no callback in either direction. This service is the asking.
 
 | Service | Required fields |
 |---|---|
@@ -176,12 +177,25 @@ Each lock creates four entities:
 
 ### Battery sensor
 
-- **State**: `10` (%) when the lock reports low battery, `90` (%) otherwise
+- **State**: a percentage, from the best source available for that lock
 - **Device class**: `battery`
 - **Attributes**:
+  - `source` — which of the three sources produced the reading
+  - `voltage` — the wakeup voltage, when a live query has supplied one
   - `low_battery` — raw boolean from the cloud or live query
 
-> **Battery percentage note:** The Lockly cloud cache only exposes a binary low/normal flag, not a precise voltage. The 10 % / 90 % values are representative sentinels, not real measurements.
+There are three sources, and the sensor prefers them in this order:
+
+| `source` | Where it comes from | How much to trust it |
+|---|---|---|
+| `reported` | the percentage the lock pushes on the MQTT channel | the lock's own figure, the same one the Lockly app shows |
+| `voltage` | `wakeup_voltage` from a live query, through our 4×AA curve | a real measurement, but our curve rather than Lockly's |
+| `low battery flag` | the cloud cache's binary low/normal flag | **not a measurement** — 10 % and 90 % are sentinels standing in for "low" and "not low" |
+
+> **Check `source` before you set a low-battery alert.** A lock that only ever
+> reports the binary flag reads 90 % when it is fine and 10 % when it is not,
+> and will never show you anything in between. Locks that push a real
+> percentage (WiFi-native models, from 0.7.11) do not have this problem.
 
 ### Door sensor
 
@@ -286,9 +300,15 @@ one of which reaches Home Assistant:
   `LOCKED_STATUS` key, where a Visage sends lowercase `lock` with the value
   `locked` or `unlocked`. Both shapes came from reading the app and neither had
   ever been checked against a live message. On these locks a keypad or app
-  unlock now reaches Home Assistant. No `magnet` key has appeared in any
-  captured callback, so the *door* sensor still only updates from a status
-  query.
+  unlock now reaches Home Assistant.
+
+  A `magnet` key does exist, carrying `opened` or `closed`, and 0.7.11 reads
+  both — until then only `closed` was understood, so a door sensor could reach
+  closed and never leave it. But the lock does not push it: tested with every
+  refresh automation disabled, opening and closing the door by hand produced no
+  callback at all. Door state is accurate and available, and only in answer to a
+  status query. Captured on
+  [#10](https://github.com/Forcky/LocklyHA/issues/10).
 
 So state is accurate immediately after you act through HA, and otherwise stale
 until the next HA command — or the next successful poll, on hubs new enough for
@@ -361,10 +381,14 @@ Credentials (email and password) are stored in HA's config entry. The integratio
   0.7.6 reads both shapes, so on these locks an unlock at the keypad or in the
   Lockly app now reaches Home Assistant.
 
-  Door state does *not* arrive this way. No `magnet` key has been seen in any
-  captured callback from these locks, so the door sensor still only updates from
-  a status query. Reported and captured on
-  [#5](https://github.com/Forcky/LocklyHA/pull/5).
+  Door state is a different matter. The lock answers a status query with its
+  `magnet` state and that reading is accurate, but it does not push the change:
+  with every refresh automation disabled, opening and closing the door by hand
+  produced no callback in either direction. So the door sensor updates when
+  something asks, not when the door moves — which is what
+  [`lockly.refresh_door_state`](#refresh-door-state-on-demand) is for. Tested on
+  a PGK728WRHK and reported on
+  [#10](https://github.com/Forcky/LocklyHA/issues/10).
 - **Silent polling requires hub firmware build ≥ 422** (for major-version-2 hubs). On older firmware `lock/cachedstatus/get` returns `cod=900` and state only updates at startup and after HA commands. Note that Lockly does not necessarily offer an upgrade: a PGH220 on `2.2.04.17` (build 417) reports itself up to date, five builds short of the requirement.
 
 - **Door sensor state is verified, but sensor _presence_ cannot be read from the lock.** Bit 0 of the status byte is the door circuit: `0` = closed, `1` = open. A closed door completes the circuit and an open door breaks it — but a lock with no sensor fitted is an open circuit permanently, so it reads `1` too. That makes `1` ambiguous between "door open" and "no sensor fitted", and this ACK carries no separate presence flag. (The hub's `lock/cachedstatus/get` response does have one, at bit 1, but that endpoint needs newer hub firmware — see above.)
