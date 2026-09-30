@@ -383,7 +383,8 @@ class LocklyCoordinator(DataUpdateCoordinator):
                         self.hass.loop.time() + LIVE_INIT_REARM_SECONDS
                     )
                     status = await api_query_lock_status(
-                        self._session, self.jwt, self.email, self.des3_key, lock
+                        self._session, self.jwt, self.email, self.des3_key, lock,
+                        quiet=True,
                     )
                     if status:
                         del self._live_init_retry_at[lock_id]
