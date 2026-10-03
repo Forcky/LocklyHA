@@ -877,8 +877,17 @@ async def api_query_lock_status(
     email: str,
     des3_key: bytes,
     lock: dict,
+    quiet: bool = False,
 ) -> dict[str, Any] | None:
-    """Query lock status via senddata. Returns parsed status dict or None."""
+    """Query lock status via senddata. Returns parsed status dict or None.
+
+    ``quiet`` logs a failure at DEBUG instead of WARNING. The coordinator's
+    background re-probe of a lock it has already given up on passes it: that
+    probe is meant to be silent on failure (AGENTS.md invariant 6), and the
+    warning here fired every 30 minutes per lock for as long as a hub stayed
+    unreachable - ~50 lines a day each, for a condition already reported once.
+    """
+    log_failure = _LOGGER.debug if quiet else _LOGGER.warning
     mc = str(lock["mc"])
     uuid = lock["ID"]
     cmd_hex = build_query_status_cmd(mc, uuid)
@@ -901,7 +910,7 @@ async def api_query_lock_status(
             body = await resp.json(content_type=None)
             cod = str(body.get("cod"))
             if cod != "200" or "ACK" not in body:
-                _LOGGER.warning(
+                log_failure(
                     "senddata status query failed: cod=%s lock=%s hubid=%s (%s)",
                     cod, lock.get("blename"), lock.get("hubid") or "(empty)",
                     describe_cod(cod),
@@ -925,7 +934,12 @@ async def api_query_lock_status(
                 parsed.setdefault("low_battery", parsed["battery_invalid"])
             return parsed
     except Exception:
-        _LOGGER.exception("senddata request failed for lock %s", lock.get("blename"))
+        if quiet:
+            _LOGGER.debug(
+                "senddata request failed for lock %s", lock.get("blename"), exc_info=True
+            )
+        else:
+            _LOGGER.exception("senddata request failed for lock %s", lock.get("blename"))
         return None
 
 
