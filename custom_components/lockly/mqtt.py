@@ -84,6 +84,29 @@ def _as_percent(raw: object) -> int | None:
 _LOG_PAYLOAD_LIMIT = 2000
 
 
+def _mqtt_username(email: str, server_client_id: str | None = None) -> str:
+    """The broker username, lowercased exactly as the app lowercases it.
+
+    `Connection.createOptions` in the Lockly app does this and nothing else to
+    the name it is given:
+
+        String lowerCase = name.toLowerCase(Locale.ROOT);
+        mqttConnectOptions.setUserName(lowerCase);
+
+    This integration sent the address as the owner typed it into the config
+    flow. The REST API does not care about case — an account with a capitalised
+    email logs in, lists its locks and looks entirely healthy — but the broker
+    refuses CONNECT with rc=5, which looks like a credential or account problem
+    and is really a capital letter. Reported on #14.
+
+    `MqttConnectionOption.getUserName()` composes `{client_id}_{email}` when the
+    server has assigned a client id, and the app lowercases the whole thing, so
+    this does too rather than only the address half.
+    """
+    name = f"{server_client_id}_{email}" if server_client_id else email
+    return name.lower()
+
+
 def _truncate(payload: bytes) -> str:
     """Decode a raw payload for the debug log, saying so if it is shortened."""
     text = payload.decode(errors="replace")
@@ -156,10 +179,12 @@ class LocklyMQTTManager:
         return candidates
 
     async def _switch_broker(self) -> None:
-        """Restart the session against the next candidate address."""
-        if self._switching:
-            return
-        self._switching = True
+        """Restart the session against the next candidate address.
+
+        `_switching` is already True — the connect handler raises it before
+        stopping paho's loop, so the disconnection that teardown causes is not
+        reported as a fault.
+        """
         try:
             await self.async_stop()
             # The new address gets its own allowance; refusals from the one we
@@ -259,6 +284,12 @@ class LocklyMQTTManager:
                         "getHeartbeatTime reported for this account",
                         host, port,
                     )
+                    # Set before stopping the loop, not inside the coroutine
+                    # that runs later: loop_stop() trips on_disconnect, and
+                    # without the flag already up that handler warns about a
+                    # disconnection we caused on purpose — reporting one
+                    # refusal twice.
+                    self._switching = True
                     client.loop_stop()
                     self._hass.loop.call_soon_threadsafe(
                         self._hass.async_create_task, self._switch_broker()
@@ -268,7 +299,7 @@ class LocklyMQTTManager:
 
         def on_disconnect(client, userdata, rc):
             self._connected = False
-            if rc != 0:
+            if rc != 0 and not self._switching:
                 _LOGGER.warning("Lockly MQTT disconnected unexpectedly rc=%s", rc)
 
         def on_subscribe(client, userdata, mid, granted_qos, properties=None):
@@ -345,7 +376,7 @@ class LocklyMQTTManager:
             # authorises subscriptions by that identity, so without the client
             # id it accepts the connection and then refuses the topic.
             server_client_id = getattr(self._coordinator, "mqtt_client_id", None)
-            username = f"{server_client_id}_{email}" if server_client_id else email
+            username = _mqtt_username(email, server_client_id)
             cli.username_pw_set(username, jwt)
             cli.on_connect = on_connect
             cli.on_disconnect = on_disconnect
@@ -390,11 +421,7 @@ class LocklyMQTTManager:
             # The address is masked: this line is a routine paste into public
             # issues, and the diagnostic value is the client id and its
             # provenance, not who the account belongs to.
-            log_username = (
-                f"{server_client_id}_{mask_email(email)}"
-                if server_client_id
-                else mask_email(email)
-            )
+            log_username = _mqtt_username(mask_email(email), server_client_id)
             _LOGGER.debug(
                 "Lockly MQTT connecting to %s:%s as %s (client id %s)",
                 host, port, log_username,

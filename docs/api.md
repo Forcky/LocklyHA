@@ -1123,6 +1123,36 @@ reported one, once, before push is abandoned. The ordering is a preference, not
 a finding — treat a refusal as "wrong broker for this account" before concluding
 anything about the credentials.
 
+### The username is lowercased
+
+`Connection.createOptions` does exactly one thing to the username it is handed:
+
+```java
+private final MqttConnectOptions createOptions(String name, String pwd) {
+    MqttConnectOptions mqttConnectOptions = new MqttConnectOptions();
+    mqttConnectOptions.setSocketFactory(MqttSSLSocketFactory.a());
+    mqttConnectOptions.setHttpsHostnameVerificationEnabled(false);
+    String lowerCase = name.toLowerCase(Locale.ROOT);
+    mqttConnectOptions.setUserName(lowerCase);
+    ...
+```
+
+`name` is `MqttConnectionOption.getUserName()`, which is `{client_id}_{email}`
+when the server has assigned a client id and the bare address otherwise — so the
+whole string is lowered, not just the address half.
+
+This deserves more attention than one line of Kotlin normally would, because of
+how it fails. The REST API is case-insensitive: an account whose owner typed a
+capitalised address logs in, lists its locks, reads their state and looks healthy
+in every respect. Only the broker cares, and it answers `rc=5` — which reads as
+"these credentials are wrong", or "this account is not entitled to push". Both
+brokers refuse it, so the address looks exonerated as well. Everything points at
+the account, and the cause is a capital letter.
+
+Fixed in 0.7.14, from a report on
+[#14](https://github.com/Forcky/LocklyHA/issues/14) by an owner whose two locks
+worked perfectly in the Lockly app throughout.
+
 ### `v1/proto/handler` — request/response, not push
 
 ```

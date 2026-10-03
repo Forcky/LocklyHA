@@ -11,7 +11,7 @@ import sys
 import threading
 sys.path.insert(0, "/config/lockly_test")  # set by the deploy step; see AGENTS.md
 
-from custom_components.lockly.mqtt import LocklyMQTTManager, _truncate
+from custom_components.lockly.mqtt import LocklyMQTTManager, _mqtt_username, _truncate
 
 ACK = "A1B2C3D429000A1E95A9B99DCBC5945E531B5EB4A643BA93BE5696D79B9791D9392AC7509E8BB800A2"
 fails = []
@@ -225,6 +225,20 @@ async def main():
 
     m._coordinator = FakeCoord(cands[0][0], 8883)
     check("the same address is not tried twice", len(m._brokers()), 1)
+
+    # The app lowercases the whole username before connecting — Connection
+    # .createOptions, name.toLowerCase(Locale.ROOT). This sent the address as
+    # typed, so a capitalised email logged in over REST and was refused by the
+    # broker with rc=5, which reads as an account problem (#14).
+    print("broker username")
+    check("a typed-in capital is lowered",
+          _mqtt_username("Name@Example.COM"), "name@example.com")
+    check("an already-lower address is untouched",
+          _mqtt_username("name@example.com"), "name@example.com")
+    check("the client id form is lowered whole",
+          _mqtt_username("Name@Example.com", "01ABC"), "01abc_name@example.com")
+    check("no client id means no prefix",
+          _mqtt_username("a@b.com", None), "a@b.com")
 
     print()
     print(f"{len(fails)} failure(s): {fails}" if fails else "all exchange checks passed")
