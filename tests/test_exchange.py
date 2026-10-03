@@ -201,6 +201,31 @@ async def main():
     check("an oversized payload is cut at the limit", out.startswith("x" * 2000), True)
     check("and says how much it dropped", out.endswith("[500 more characters]"), True)
 
+    # The hardcoded broker is right for the account this was built against, and
+    # an rc=5 there used to end push for good. Another account's API reports a
+    # different Lockly broker (#14), so that one is kept as a second try.
+    print("broker candidates")
+
+    class FakeCoord:
+        def __init__(self, host=None, port=None):
+            self.mqtt_host, self.mqtt_port = host, port
+            self.data = {}
+
+    m._coordinator = FakeCoord()
+    check("no API address — one candidate", len(m._brokers()), 1)
+
+    m._coordinator = FakeCoord("mqtt-clb-1143679798.us-west-2.elb.amazonaws.com", 8883)
+    cands = m._brokers()
+    check("API address is a second candidate", len(cands), 2)
+    check("the hardcoded one is still tried first", cands[0][0].startswith("mqttuswest02"), True)
+    check("then the reported one", cands[1], ("mqtt-clb-1143679798.us-west-2.elb.amazonaws.com", 8883))
+
+    m._coordinator = FakeCoord("mqtt-clb-1143679798.us-west-2.elb.amazonaws.com", None)
+    check("a missing port falls back to 8883", m._brokers()[1][1], 8883)
+
+    m._coordinator = FakeCoord(cands[0][0], 8883)
+    check("the same address is not tried twice", len(m._brokers()), 1)
+
     print()
     print(f"{len(fails)} failure(s): {fails}" if fails else "all exchange checks passed")
     return 1 if fails else 0

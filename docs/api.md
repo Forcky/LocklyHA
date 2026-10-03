@@ -995,7 +995,7 @@ far is closed, and the notes below exist so nobody repeats the work.
 | `username = email`, `password = <jwt>` | CONNECT accepted (rc=0), subscription refused (SUBACK `0x80`) |
 | Add the app's client certificate (mTLS, see above) | No change — client identity was not the blocker |
 | `getHeartbeatTime` for a server-assigned client id | The returned `clientId` is an echo of the `deviceId` in the request, so `{clientId}_{email}` carries no new information |
-| The broker address `getHeartbeatTime` reports | A different host from `PgConfig`'s, and it refuses CONNECT outright (`rc=5`) |
+| The broker address `getHeartbeatTime` reports | A different host from `PgConfig`'s, and on this account it refuses CONNECT outright (`rc=5`). Not on every account: see below |
 | `POST v1/proto/handler` | Request/response only, so structurally incapable of push; also gated (below) |
 
 > **Superseded.** The section below concluded that push is impossible because
@@ -1103,6 +1103,25 @@ trace was performed on a question that only appeared to be the blocker.
 > minute against Lockly's broker. Treat `rc=5` as permanent and stop the loop.
 > Guessing at credentials means sending authenticated traffic at their
 > infrastructure, and that has consequences.
+
+### Two brokers, and `rc=5` may just mean the wrong one
+
+`PgConfig` hardcodes `mqttuswest02-lb-001-…`, and that is the host the official
+app was captured connecting to. But `getHeartbeatTime` hands some accounts a
+different address — `mqtt-clb-1143679798.us-west-2.elb.amazonaws.com` — and that
+one is not fictional either: it is what an official app was seen using in its
+owner's own traffic on [#1](https://github.com/Forcky/LocklyHA/issues/1).
+
+On the account this integration was developed against, the reported address
+refuses CONNECT and the hardcoded one is accepted, which is why the hardcoded
+one is tried first. That is a single account's evidence, and a `PGK728WRHK`
+owner on [#14](https://github.com/Forcky/LocklyHA/issues/14) got `rc=5` from the
+hardcoded address while his API reported the other one.
+
+So from 0.7.13 both are tried: the hardcoded address first, and on a refusal the
+reported one, once, before push is abandoned. The ordering is a preference, not
+a finding — treat a refusal as "wrong broker for this account" before concluding
+anything about the credentials.
 
 ### `v1/proto/handler` — request/response, not push
 

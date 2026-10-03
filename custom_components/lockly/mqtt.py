@@ -121,6 +121,10 @@ class LocklyMQTTManager:
         self._refusals = 0
         self._gave_up = False
         self._client_id: str | None = None
+        # Which entry of _brokers() the next connect uses. Advanced once, by a
+        # refusal, so a second address gets one try before push is abandoned.
+        self._broker_index = 0
+        self._switching = False
         # requestId -> future awaiting that exchange's lockCommandResponse.
         self._pending: dict[str, asyncio.Future] = {}
 
@@ -128,6 +132,42 @@ class LocklyMQTTManager:
     def connected(self) -> bool:
         """True once the broker has accepted the connection."""
         return self._connected
+
+    def _brokers(self) -> list[tuple[str, int]]:
+        """The broker addresses to try, in order.
+
+        PgConfig's hardcoded address first: a network capture of the official
+        app shows it connecting there, and on the account this was developed
+        against the API-reported address refuses CONNECT with rc=5 where this
+        one is accepted. That is one account's evidence, though, and the API
+        hands out a different address to others — `mqtt-clb-…` is a real Lockly
+        broker, seen in an official app's own traffic on #1. So the reported
+        address is kept as a second candidate rather than discarded, because a
+        refusal here costs the user all push and we only ever tried one host.
+
+        Host and port travel together: a port from one broker's config means
+        nothing against another's address.
+        """
+        candidates = [(_BROKER, _PORT)]
+        api_host = getattr(self._coordinator, "mqtt_host", None)
+        api_port = getattr(self._coordinator, "mqtt_port", None)
+        if api_host and api_host != _BROKER:
+            candidates.append((api_host, int(api_port or _PORT)))
+        return candidates
+
+    async def _switch_broker(self) -> None:
+        """Restart the session against the next candidate address."""
+        if self._switching:
+            return
+        self._switching = True
+        try:
+            await self.async_stop()
+            # The new address gets its own allowance; refusals from the one we
+            # just left say nothing about this one.
+            self._refusals = 0
+            await self.async_start()
+        finally:
+            self._switching = False
 
     def _give_up(self) -> None:
         """Stop paho's reconnect loop after an unrecoverable refusal.
@@ -199,13 +239,31 @@ class LocklyMQTTManager:
                 # risks the account being throttled.
                 self._refusals += 1
                 permanent = rc == 5
+                # A refusal on the first address is not proof the account has no
+                # push — it may be the wrong broker for this account. If the API
+                # named a different one, try that before writing push off.
+                next_broker = self._broker_index + 1 < len(self._brokers())
                 _LOGGER.warning(
                     "Lockly MQTT connection refused rc=%s%s — real-time push "
                     "disabled, polling continues",
                     rc,
-                    " (not authorised; not retrying)" if permanent else "",
+                    " (not authorised; not retrying)"
+                    if permanent and not next_broker
+                    else "",
                 )
-                if permanent or self._refusals >= _MAX_REFUSALS:
+                if (permanent or self._refusals >= _MAX_REFUSALS) and next_broker:
+                    self._broker_index += 1
+                    host, port = self._brokers()[self._broker_index]
+                    _LOGGER.info(
+                        "Lockly MQTT: trying %s:%s instead, the address "
+                        "getHeartbeatTime reported for this account",
+                        host, port,
+                    )
+                    client.loop_stop()
+                    self._hass.loop.call_soon_threadsafe(
+                        self._hass.async_create_task, self._switch_broker()
+                    )
+                elif permanent or self._refusals >= _MAX_REFUSALS:
                     self._give_up()
 
         def on_disconnect(client, userdata, rc):
@@ -318,22 +376,16 @@ class LocklyMQTTManager:
                 )
             )
             await self._hass.async_add_executor_job(cli.tls_insecure_set, True)
-            # PgConfig's hardcoded address, not the one getHeartbeatTime
-            # returns.  A network capture of the official app shows it
-            # connecting to this host, and the API-reported address refuses
-            # CONNECT outright with rc=5 where this one is accepted (and then
-            # refuses the subscription, which is the real blocker).  Preferring
-            # the API's address looked more correct and was strictly worse.
-            # Host and port travel together: taking the port from a different
-            # broker's config would be meaningless.
-            host, port = _BROKER, _PORT
-            api_host = getattr(self._coordinator, "mqtt_host", None)
-            if api_host and api_host != host:
+            # See _brokers() for why there is an order and what the second
+            # entry is. _broker_index only moves when a connection is refused.
+            candidates = self._brokers()
+            host, port = candidates[min(self._broker_index, len(candidates) - 1)]
+            if len(candidates) > 1:
                 _LOGGER.debug(
-                    "Lockly MQTT: using PgConfig broker %s, not the address the "
-                    "API reported (%s) — the app uses the former and the latter "
-                    "refuses CONNECT",
-                    host, api_host,
+                    "Lockly MQTT: %s of %s broker addresses — %s, with %s held "
+                    "in reserve if this one refuses the connection",
+                    self._broker_index + 1, len(candidates), host,
+                    candidates[-1][0] if self._broker_index == 0 else candidates[0][0],
                 )
             # The address is masked: this line is a routine paste into public
             # issues, and the diagnostic value is the client id and its
