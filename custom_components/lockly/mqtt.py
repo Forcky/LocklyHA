@@ -93,15 +93,23 @@ def _mqtt_username(email: str, server_client_id: str | None = None) -> str:
         String lowerCase = name.toLowerCase(Locale.ROOT);
         mqttConnectOptions.setUserName(lowerCase);
 
-    This integration sent the address as the owner typed it into the config
-    flow. The REST API does not care about case — an account with a capitalised
-    email logs in, lists its locks and looks entirely healthy — but the broker
-    refuses CONNECT with rc=5, which looks like a credential or account problem
-    and is really a capital letter. Reported on #14.
+    Before 0.7.14 this integration sent the address exactly as typed into the
+    config flow. It was a credible suspect for the rc=5 on #14 and was ruled
+    out there — that reporter's address was already lowercase — but lowering
+    it is still what the app does, so it stays.
 
-    `MqttConnectionOption.getUserName()` composes `{client_id}_{email}` when the
-    server has assigned a client id, and the app lowercases the whole thing, so
-    this does too rather than only the address half.
+    The prefix is the **Team ID**, not anything the server assigns.
+    `MqttConnectionOption.getUserName()` builds `{prefix}_{email}` from
+    `user_client_id_1208`, and in both decompiled apps the only thing that
+    writes that key is a successful login, storing the value it was sent as
+    `cloudId`. In LOCKLY 3.2.9 that is the login screen's "Team ID" box
+    (`et_login_client_id`, re-sent on every launch by `SplashScreen`); in
+    Lockly Home 1.4.8 it is empty for ordinary logins and set only by account
+    migration. A regular account therefore has no prefix and connects as the
+    bare address, which is what this integration does. Team (WorkSpace)
+    accounts are not supported yet: they would need the Team ID sent at login
+    and passed here. The app lowercases the whole composed string, so this
+    does too.
     """
     name = f"{server_client_id}_{email}" if server_client_id else email
     return name.lower()
@@ -370,11 +378,11 @@ class LocklyMQTTManager:
             except (AttributeError, TypeError):
                 cli = paho.Client(client_id=client_id, protocol=paho.MQTTv311)  # paho 1.x
 
-            # MqttConnectionOption.getUserName() returns
-            # "{user_client_id}_{email}" when a server-assigned client id is
-            # known, falling back to the bare email otherwise.  The broker
-            # authorises subscriptions by that identity, so without the client
-            # id it accepts the connection and then refuses the topic.
+            # The app's username is "{Team ID}_{email}" for a team account and
+            # the bare email otherwise — see _mqtt_username. mqtt_client_id here
+            # is getHeartbeatTime's value, which the app never uses for this; it
+            # is always an echo of the id we sent and the coordinator discards
+            # it, so in practice this is None and the username is the email.
             server_client_id = getattr(self._coordinator, "mqtt_client_id", None)
             username = _mqtt_username(email, server_client_id)
             cli.username_pw_set(username, jwt)

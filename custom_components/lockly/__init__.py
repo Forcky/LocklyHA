@@ -208,9 +208,13 @@ class LocklyCoordinator(DataUpdateCoordinator):
         self.locks, self.des3_key = await api_get_devices(self._session, self.jwt, self.email)
         if not self.locks:
             raise UpdateFailed("Lockly: no locks found after login")
-        # The broker authorises subscriptions by client identity, so fetch the
-        # push config before (re)connecting.  Uses the config entry id as a
-        # stable per-install device id, standing in for the app's own.
+        # Fetch the broker address before (re)connecting — its host is a real
+        # second candidate (see LocklyMQTTManager._brokers). Uses the config
+        # entry id as a stable per-install device id, standing in for the app's.
+        #
+        # Its client_id is NOT the source of the app's username prefix. That
+        # prefix is the Team ID typed at login (see mqtt._mqtt_username); this
+        # value has only ever come back as an echo of the device id we send.
         heartbeat = await api_get_heartbeat(
             self._session, self.jwt, self.des3_key, self.config_entry.entry_id
         )

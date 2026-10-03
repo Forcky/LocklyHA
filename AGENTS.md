@@ -53,6 +53,21 @@ Scope every search to a subdirectory (`sources/android/content/res/data` is
 usually the right one) and wrap it in `timeout`. If a search returns nothing,
 confirm it actually completed before treating that as evidence.
 
+**The two trees do not share a layout.** `jadx_home_out` keeps its UI under
+`android/content/res/ui/`; `jadx_out` (LOCKLY) renames it `p019ui/`, and other
+packages carry `pNNN` prefixes too. A search scoped to `ui/` in `jadx_out`
+completes cleanly and returns nothing, which looks exactly like "not in this
+app". It happened while tracing the MQTT username: LOCKLY's login screen, the
+one place its Team ID is entered, only turned up by searching for the
+`LoginResponse` consumer instead of a directory. When a scoped search comes back
+empty in one tree, `ls` the scope first and look for a class you know exists.
+
+**Which app the users run.** "The Lockly app" is LOCKLY (`jadx_out`, 3.2.9 here;
+users report 3.3.x). Lockly Home is the second app. They diverge in places that
+matter — LOCKLY's login has a Team ID field that becomes the MQTT username
+prefix; Lockly Home's ordinary login sends an empty one — so a finding in one
+tree is a hypothesis about the other until it has been checked there.
+
 ---
 
 ## Checks before you push

@@ -992,9 +992,9 @@ far is closed, and the notes below exist so nobody repeats the work.
 
 | Attempt | Result |
 |---|---|
-| `username = email`, `password = <jwt>` | CONNECT accepted (rc=0), subscription refused (SUBACK `0x80`) |
+| `username = email`, `password = <jwt>` | CONNECT accepted (rc=0), subscription refused (SUBACK `0x80`). **No longer true on this account:** on 2026-10-02 the same lowercase email, JWT and `PgConfig` broker got `rc=5` at CONNECT. When that changed is not known |
 | Add the app's client certificate (mTLS, see above) | No change — client identity was not the blocker |
-| `getHeartbeatTime` for a server-assigned client id | The returned `clientId` is an echo of the `deviceId` in the request, so `{clientId}_{email}` carries no new information |
+| `getHeartbeatTime` for a server-assigned client id | The returned `clientId` is an echo of the `deviceId` in the request. It was also the wrong place to look: the app's username prefix is the **Team ID** typed at login, never this value — see [the username prefix](#the-username-prefix-is-the-team-id) |
 | The broker address `getHeartbeatTime` reports | A different host from `PgConfig`'s, and on this account it refuses CONNECT outright (`rc=5`). Not on every account: see below |
 | `POST v1/proto/handler` | Request/response only, so structurally incapable of push; also gated (below) |
 
@@ -1141,17 +1141,59 @@ private final MqttConnectOptions createOptions(String name, String pwd) {
 when the server has assigned a client id and the bare address otherwise — so the
 whole string is lowered, not just the address half.
 
-This deserves more attention than one line of Kotlin normally would, because of
-how it fails. The REST API is case-insensitive: an account whose owner typed a
-capitalised address logs in, lists its locks, reads their state and looks healthy
-in every respect. Only the broker cares, and it answers `rc=5` — which reads as
-"these credentials are wrong", or "this account is not entitled to push". Both
-brokers refuse it, so the address looks exonerated as well. Everything points at
-the account, and the cause is a capital letter.
+Before 0.7.14 this integration sent the address as typed into the config flow.
+The REST API is case-insensitive, so a capitalised address would log in and list
+its locks while the broker refused it with `rc=5` — a failure that points at the
+account rather than at a capital letter. Lowercasing matches the app and is
+kept.
 
-Fixed in 0.7.14, from a report on
-[#14](https://github.com/Forcky/LocklyHA/issues/14) by an owner whose two locks
-worked perfectly in the Lockly app throughout.
+It was **not** the cause of the `rc=5` on
+[#14](https://github.com/Forcky/LocklyHA/issues/14), which prompted the change:
+that reporter's address was already lowercase, and so is the address on the
+account this integration was developed against, which also gets `rc=5`.
+
+### The username prefix is the Team ID
+
+`getUserName()` returns `{prefix}_{email}` when the stored prefix is non-empty.
+For a long time this document — and the code comments — called that prefix a
+"server-assigned client id" and looked for it in `getHeartbeatTime`. That was
+wrong, and both decompiled apps say so.
+
+The prefix is read from SharedPreferences key `user_client_id_1208`. In both
+apps the only thing that writes it is a successful login, storing the value it
+sent in the login request as `cloudId`:
+
+```java
+// LOCKLY 3.2.9 — p019ui/activity/sys/LoginActivity, tv_login
+String trim3 = this.f66668B.getText().toString().trim();   // et_login_client_id
+...
+PGNetManager.getInstance().login(str, str2, str3)          // AccountQueryRequest.cloudId
+...
+LockerConfig.m61299Ja(str, str3);                          // user_client_id_1208
+```
+
+`et_login_client_id` is labelled **"Team ID"** (`R.string.client_id`) and
+appears in one of the login screen's two modes ("Regular user login" /
+"Existing user login"). `SplashScreen` re-sends the stored value on every
+launch, so a team user types it once. Lockly Home 1.4.8 passes `""` for an
+ordinary login and sets the prefix only during account migration
+(`MigrationViewModel`).
+
+So:
+
+| Account | Login `cloudId` | Broker username |
+|---|---|---|
+| Regular | empty | the email, lowercased |
+| Team (WorkSpace) | the Team ID | `{teamid}_{email}`, lowercased |
+
+This integration supports only the first. A team account would need the Team ID
+collected in the config flow, sent as `cloudId` at login, and used as the
+prefix. Not built yet: no team account has been confirmed among users so far.
+
+The rest of the connection matches the app field for field — broker from
+`PgConfig`, a client id the app generates itself
+(`UUID.randomUUID()` hex, persisted), and the login token with
+`TOKEN_PREFIX = "Bearer "` stripped as the password.
 
 ### `v1/proto/handler` — request/response, not push
 
