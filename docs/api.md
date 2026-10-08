@@ -992,7 +992,7 @@ far is closed, and the notes below exist so nobody repeats the work.
 
 | Attempt | Result |
 |---|---|
-| `username = email`, `password = <jwt>` | CONNECT accepted (rc=0), subscription refused (SUBACK `0x80`). **No longer true on this account:** on 2026-10-02 the same lowercase email, JWT and `PgConfig` broker got `rc=5` at CONNECT. When that changed is not known |
+| `username = email`, `password = <jwt>` | CONNECT accepted (rc=0), subscription refused (SUBACK `0x80`). On 2026-10-02 the same lowercase email, JWT and `PgConfig` broker got `rc=5` at CONNECT; by 2026-10-08 the same account sending the same fields was accepted again, holding an established session on `PgConfig`'s broker. No code change in between affected those fields, so the refusal came from outside the request — the token at that moment, or something on Lockly's side — and was transient. What caused it is not known |
 | Add the app's client certificate (mTLS, see above) | No change — client identity was not the blocker |
 | `getHeartbeatTime` for a server-assigned client id | The returned `clientId` is an echo of the `deviceId` in the request. It was also the wrong place to look: the app's username prefix is the **Team ID** typed at login, never this value — see [the username prefix](#the-username-prefix-is-the-team-id) |
 | The broker address `getHeartbeatTime` reports | A different host from `PgConfig`'s, and on this account it refuses CONNECT outright (`rc=5`). Not on every account: see below |
@@ -1150,7 +1150,8 @@ kept.
 It was **not** the cause of the `rc=5` on
 [#14](https://github.com/Forcky/LocklyHA/issues/14), which prompted the change:
 that reporter's address was already lowercase, and so is the address on the
-account this integration was developed against, which also gets `rc=5`.
+account this integration was developed against, which got `rc=5` on 2026-10-02
+and was accepted again by 2026-10-08 without any change to what it sends.
 
 ### The username prefix is the Team ID
 

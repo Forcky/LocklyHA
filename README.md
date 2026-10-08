@@ -141,11 +141,21 @@ Automation acts on the next door-close transition, not on the current state.
 
 ### Refresh door state on demand
 
-The door sensor updates when the lock is commanded, and when something asks the
-lock directly. It does not update when the door moves: a WiFi-native lock knows
-its own `magnet` state and reports it accurately when queried, but never pushes
-the change. Opening and closing a door by hand, with no query running, produces
-no callback in either direction. This service is the asking.
+The door sensor updates when the lock is commanded, when something asks the lock
+directly, and — on some locks — when the door moves. Whether a WiFi-native lock
+pushes its `magnet` state by itself **varies by lock**, and what decides it is
+not yet known:
+
+| Lock | Firmware | Pushes door changes unprompted? |
+|---|---|---|
+| PGK728WRHK | 1.14.31 | **yes**, with native Auto-Detection on *and* off |
+| PGK728WRHK | 3.00.24 | **no**, in a test with every query switched off |
+
+Both were tested with no status queries running. Native Auto-Detection was ruled
+out as the cause by switching it off on the lock that pushes; it kept pushing.
+Firmware is the obvious suspect, but one lock on each version can't establish
+it. On a lock that doesn't push, this service is the only way to learn the door
+moved; on one that does, it is a way to be certain.
 
 | Service | Required fields |
 |---|---|
@@ -312,10 +322,11 @@ one of which reaches Home Assistant:
 
   A `magnet` key does exist, carrying `opened` or `closed`, and 0.7.11 reads
   both — until then only `closed` was understood, so a door sensor could reach
-  closed and never leave it. But the lock does not push it: tested with every
-  refresh automation disabled, opening and closing the door by hand produced no
-  callback at all. Door state is accurate and available, and only in answer to a
-  status query. Captured on
+  closed and never leave it. Whether a lock sends it unprompted varies: one
+  PGK728WRHK on firmware 1.14.31 does, with native Auto-Detection on or off, and
+  one on 3.00.24 produced no callback at all with every refresh disabled. What
+  decides it is not established — see
+  [Refresh door state on demand](#refresh-door-state-on-demand). Captured on
   [#10](https://github.com/Forcky/LocklyHA/issues/10).
 
 So state is accurate immediately after you act through HA, and otherwise stale
@@ -389,13 +400,15 @@ Credentials (email and password) are stored in HA's config entry. The integratio
   0.7.6 reads both shapes, so on these locks an unlock at the keypad or in the
   Lockly app now reaches Home Assistant.
 
-  Door state is a different matter. The lock answers a status query with its
-  `magnet` state and that reading is accurate, but it does not push the change:
-  with every refresh automation disabled, opening and closing the door by hand
-  produced no callback in either direction. So the door sensor updates when
-  something asks, not when the door moves — which is what
-  [`lockly.refresh_door_state`](#refresh-door-state-on-demand) is for. Tested on
-  a PGK728WRHK and reported on
+  Door state depends on the lock. Every WiFi-native lock answers a status query
+  with an accurate `magnet` reading, but only some push the change by
+  themselves: a PGK728WRHK on firmware 1.14.31 does, whether native
+  Auto-Detection is on or off, and one on 3.00.24 produced no callback in either
+  direction with every refresh disabled. On a lock that doesn't push, the door
+  sensor updates when something asks, not when the door moves — which is what
+  [`lockly.refresh_door_state`](#refresh-door-state-on-demand) is for. Firmware is
+  the leading suspect for the difference but is not established. Tested on two
+  PGK728WRHK and reported on
   [#10](https://github.com/Forcky/LocklyHA/issues/10).
 - **Silent polling requires hub firmware build ≥ 422** (for major-version-2 hubs). On older firmware `lock/cachedstatus/get` returns `cod=900` and state only updates at startup and after HA commands. Note that Lockly does not necessarily offer an upgrade: a PGH220 on `2.2.04.17` (build 417) reports itself up to date, five builds short of the requirement.
 
