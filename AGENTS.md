@@ -321,6 +321,10 @@ The integration connects to the Lockly Paho MQTT broker at startup (`mqtt.py`):
 
 MQTT is additive — if the broker rejects the connection (logged at WARNING), the coordinator continues in polling-only mode without errors.
 
+**The token is renewed, and that must not wake the locks.** Lockly's JWT lasts 24 hours and the broker checks it at every CONNECT, including paho's own automatic reconnects. `LocklyCoordinator._schedule_token_renewal` logs in again an hour before `exp`, through `async_renew_login`, and `LocklyMQTTManager.async_update_credentials` gives the new token to the live client without dropping the session. Do not route renewal through `_authenticate`. That also re-arms the cachedstatus probe and the live status query, and the live query wakes every lock over Bluetooth (invariant 6). A daily token is no reason to do that.
+
+**A refusal is retried with a fresh login, slowly.** Once every broker address has refused, `_handle_connect` stops paho's loop (still required, see the caution in `docs/api.md`) and schedules `_async_recover` on `_RECOVERY_DELAYS`: 30 s, then backing off to every 6 h. Each attempt logs in afresh and starts again from the first address. Keep it bounded and slow. Never retry a refused CONNECT with the same token.
+
 ---
 
 ## Error codes

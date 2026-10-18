@@ -3,7 +3,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 [![GitHub Release](https://img.shields.io/github/v/release/Forcky/LocklyHA)](https://github.com/Forcky/LocklyHA/releases)
-[![Version](https://img.shields.io/badge/version-0.7.14-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.14)
+[![Version](https://img.shields.io/badge/version-0.7.15-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.15)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Control and monitor your **Lockly smart locks** from Home Assistant. This integration communicates with the Lockly cloud API using the same protocol as the official Lockly mobile app.
@@ -456,7 +456,8 @@ Credentials (email and password) are stored in HA's config entry. The integratio
 - Check HA logs for `getlkhist failed: cod=` lines with debug logging enabled.
 
 **MQTT shows "connection refused" in logs**
-- The MQTT username format or broker address may differ from what was extracted from the APK. Enable debug logging to see the exact error code. The integration continues working in poll-only mode regardless.
+- `rc=5` ("not authorised") has so far followed the login token rather than the account: on the account this was developed against, a fresh login cleared every one. From 0.7.15 the integration does that itself. Once every broker address has refused, it logs in again and retries after 30 seconds, then 5 minutes, and so on up to every 6 hours, and the warning says when the next try is. Polling carries on in the meantime. It also renews the login token an hour before the token expires, so a reconnect is never offered a stale one.
+- Recovery logs `Lockly MQTT connected again after a fresh login` at INFO, so you need `custom_components.lockly: info` or `debug` under `logger:` to see it. If refusals keep coming for hours, please open an issue with the log.
 
 **`lockly.add_guest` succeeds but PIN does not work on the lock**
 - The guest record was created on the server but the PIN may not have been pushed to the lock hardware. Open an issue with your lock model so the passcode activation step can be implemented.

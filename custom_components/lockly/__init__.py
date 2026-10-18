@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -48,6 +49,7 @@ from .api import (
     parse_pwd_list_ack,
     host_password_from,
     is_transient_cod,
+    token_renewal_delay,
 )
 from .capabilities import LockCapabilities, resolve_capabilities
 from .mqtt import LocklyMQTTManager
@@ -68,6 +70,7 @@ from .const import (
     SERVICE_DISABLE_NATIVE_AUTO_LOCK,
     SERVICE_ENABLE_NATIVE_AUTO_LOCK,
     SERVICE_LIST_GUESTS,
+    TOKEN_RENEW_MIN_SECONDS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -105,8 +108,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await coordinator.async_config_entry_first_refresh()
     except ConfigEntryAuthFailed:
+        # A login that succeeded before the failure has already scheduled its
+        # renewal; this coordinator is about to be discarded, so cancel it.
+        await coordinator.async_shutdown()
         raise
     except Exception as exc:
+        await coordinator.async_shutdown()
         raise ConfigEntryNotReady from exc
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
@@ -195,19 +202,28 @@ class LocklyCoordinator(DataUpdateCoordinator):
         self.mqtt_client_id: str | None = None
         self.mqtt_host: str | None = None
         self.mqtt_port: int | None = None
+        # Cancels the pending login-token renewal, when one is scheduled.
+        self._token_renewal_cancel = None
 
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
 
-    async def _authenticate(self) -> None:
+    async def _login(self) -> None:
+        """Log in and fetch what a session needs: token, locks, key and broker.
+
+        Nothing is replaced until the login and the device list have both
+        succeeded, so a renewal that fails part way leaves the current session
+        whole instead of a new token paired with the old key.
+        """
         await self._ensure_session()
-        self.jwt = await api_login(self._session, self.email, self.password)
-        if not self.jwt:
+        jwt = await api_login(self._session, self.email, self.password)
+        if not jwt:
             raise ConfigEntryAuthFailed("Lockly login failed — check email/password")
-        self.locks, self.des3_key = await api_get_devices(self._session, self.jwt, self.email)
-        if not self.locks:
+        locks, des3_key = await api_get_devices(self._session, jwt, self.email)
+        if not locks:
             raise UpdateFailed("Lockly: no locks found after login")
+        self.jwt, self.locks, self.des3_key = jwt, locks, des3_key
         # Fetch the broker address before (re)connecting — its host is a real
         # second candidate (see LocklyMQTTManager._brokers). Uses the config
         # entry id as a stable per-install device id, standing in for the app's.
@@ -236,8 +252,11 @@ class LocklyCoordinator(DataUpdateCoordinator):
                 self.mqtt_host or "(default)",
                 self.mqtt_port or "(default)",
             )
+        self._schedule_token_renewal()
 
-        # The MQTT broker authenticates with the JWT, so a rotated token needs a
+    async def _authenticate(self) -> None:
+        await self._login()
+        # The MQTT broker authenticates with the JWT, so a new token needs a
         # fresh session or push stops silently.
         mqtt = getattr(self, "_mqtt_manager", None)
         if mqtt is not None:
@@ -281,6 +300,56 @@ class LocklyCoordinator(DataUpdateCoordinator):
                 "set" if lock.get("clientId") else "empty",
                 self._caps_for(lock),
             )
+
+    def _schedule_token_renewal(self, delay: float | None = None) -> None:
+        """Arrange the next login, an hour before the current token expires.
+
+        Lockly's tokens last 24 hours and nothing else here asks for a new one:
+        the poll uses whatever it was given at startup, for as long as Home
+        Assistant runs. The broker checks the token only when a connection is
+        made, so an expired one goes unnoticed until the first reconnect, which
+        is then refused with rc=5.
+        """
+        if self._token_renewal_cancel is not None:
+            self._token_renewal_cancel()
+        if delay is None:
+            delay = token_renewal_delay(self.jwt, time.time())
+        self._token_renewal_cancel = async_call_later(
+            self.hass, delay, self._async_renew_token
+        )
+        _LOGGER.debug("Lockly: next login-token renewal in %.1f h", delay / 3600)
+
+    async def _async_renew_token(self, _now=None) -> None:
+        """Timer callback: renew the token and hand it to the MQTT client."""
+        self._token_renewal_cancel = None
+        if not await self.async_renew_login():
+            self._schedule_token_renewal(TOKEN_RENEW_MIN_SECONDS)
+            return
+        mqtt = getattr(self, "_mqtt_manager", None)
+        if mqtt is not None:
+            mqtt.async_update_credentials()
+
+    async def async_renew_login(self) -> bool:
+        """Log in afresh and keep everything else as it is.
+
+        Not ``_authenticate``: that also re-arms the cachedstatus probe and the
+        live status query, and the live query wakes every lock over Bluetooth.
+        A new token is no reason to wake anything. Returns False, keeping the
+        current session, if the login fails.
+        """
+        try:
+            await self._login()
+        except (ConfigEntryAuthFailed, UpdateFailed) as err:
+            _LOGGER.warning(
+                "Lockly: could not renew the login token (%s) — keeping the "
+                "current one for now",
+                err,
+            )
+            return False
+        except Exception:  # noqa: BLE001 - a timer callback; its retries must survive
+            _LOGGER.exception("Lockly: login-token renewal failed unexpectedly")
+            return False
+        return True
 
     def _caps_for(self, lock: dict) -> LockCapabilities:
         """Capabilities for a lock, using its reported lock type when known."""
@@ -1192,8 +1261,11 @@ class LocklyCoordinator(DataUpdateCoordinator):
                 self.async_set_updated_data(updated)
 
     async def async_shutdown(self) -> None:
+        if self._token_renewal_cancel is not None:
+            self._token_renewal_cancel()
+            self._token_renewal_cancel = None
         if hasattr(self, "_mqtt_manager"):
-            await self._mqtt_manager.async_stop()
+            await self._mqtt_manager.async_shutdown()
         for cancel in self._history_cancel:
             cancel()
         self._history_cancel.clear()

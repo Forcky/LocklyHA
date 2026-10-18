@@ -22,6 +22,22 @@ CONF_PASSWORD = "password"
 SCAN_INTERVAL_SECONDS = 30
 HISTORY_INTERVAL_SECONDS = 300  # 5 minutes — access log poll
 
+# Login token renewal. Lockly's tokens last exactly 24 hours (exp - iat = 86400
+# in every one seen), and nothing else here asks for a new one, so without this
+# the token handed to the broker at startup is the one it is still offered a
+# week later. The broker only checks it when a connection is made, which is why
+# that goes unnoticed until the first reconnect — and then that reconnect is
+# refused with rc=5. Renew this long before the token's own expiry...
+TOKEN_RENEW_MARGIN_SECONDS = 3600
+# ...but never sooner than this, so a token that arrives already close to
+# expiry (or a clock that disagrees with Lockly's) cannot become a login loop.
+# Also the wait before trying again after a renewal fails.
+TOKEN_RENEW_MIN_SECONDS = 1800
+# ...and never later than this, in case a token ever claims a longer life.
+TOKEN_RENEW_MAX_SECONDS = 23 * 3600
+# When the token's expiry cannot be read at all.
+TOKEN_RENEW_FALLBACK_SECONDS = 12 * 3600
+
 # First access-log fetch after setup. Short enough that Last Access populates
 # promptly, long enough to stay clear of the startup burst.
 

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import paho.mqtt.client as paho
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.event import async_call_later
 
 from .api import mask_email
 
@@ -35,6 +36,25 @@ _CLIENT_TOPIC_PREFIX = "client/"
 
 # Give up after this many non-permanent refusals rather than reconnecting forever.
 _MAX_REFUSALS = 3
+
+# Once every broker address has refused, log in afresh and try again after
+# these delays in seconds, holding at the last. A refusal used to end push
+# until Home Assistant restarted. But on the account this was developed
+# against, every rc=5 in a month of logs followed the token rather than the
+# account: a fresh login cleared each one, twice within seconds. So the first
+# retry is quick. The later ones are slow, because each costs a login plus a
+# connection attempt at every address, and a refusal that a new token does
+# not clear will not clear for being asked every minute either.
+_RECOVERY_DELAYS = (30, 300, 1800, 3600, 7200, 14400, 21600)
+
+
+def _describe_delay(seconds: float) -> str:
+    """A recovery delay as a person would say it: 30 s, 5 min, 2 h."""
+    if seconds < 60:
+        return f"{seconds:.0f} s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.0f} h"
 
 # Values a deviceStateCallback carries for the states this reads. The word forms
 # are what a Visage actually sends, captured on issues #5 and #10; the numeric
@@ -141,7 +161,8 @@ class LocklyMQTTManager:
     """Connect to the Lockly Paho MQTT broker and update coordinator on DEVICE_STATE messages.
 
     Auth: JWT bearer token as MQTT password; username = account email.
-    Falls back to polling-only mode if MQTT connection is refused (rc != 0).
+    Falls back to polling while the broker refuses the connection, and keeps
+    trying with a fresh login on the slow schedule in _RECOVERY_DELAYS.
     """
 
     def __init__(self, hass: HomeAssistant, coordinator) -> None:
@@ -156,6 +177,13 @@ class LocklyMQTTManager:
         # refusal, so a second address gets one try before push is abandoned.
         self._broker_index = 0
         self._switching = False
+        # Fresh-login retries since the last accepted connection; indexes
+        # _RECOVERY_DELAYS. The cancel handle is for the one waiting to run.
+        self._recoveries = 0
+        self._recovery_cancel = None
+        # Set by async_shutdown. Nothing may start a session after that,
+        # including a recovery that was part way through logging in.
+        self._closed = False
         # requestId -> future awaiting that exchange's lockCommandResponse.
         self._pending: dict[str, asyncio.Future] = {}
 
@@ -218,6 +246,131 @@ class LocklyMQTTManager:
         except Exception:  # noqa: BLE001 - teardown must not raise
             _LOGGER.debug("Lockly MQTT: error while stopping the client", exc_info=True)
 
+    def _handle_connect(self, client, rc: int, client_id: str) -> None:
+        """Act on the broker's answer to CONNECT. Runs on paho's thread."""
+        if rc == 0:
+            self._connected = True
+            self._refusals = 0
+            # Logged at info: without it there is no way to tell a working
+            # push connection from one that silently never connected.
+            topic = _CLIENT_TOPIC_PREFIX + client_id
+            _LOGGER.info(
+                "Lockly MQTT connected%s, subscribing to %r",
+                " again after a fresh login" if self._recoveries else "",
+                topic,
+            )
+            self._recoveries = 0
+            client.subscribe(topic, qos=0)
+            return
+
+        self._connected = False
+        # rc=5 is "not authorised". Whatever the cause, asking again with the
+        # same token gets the same answer, and paho's network loop reconnects
+        # on its own, so without stopping it here this becomes a
+        # connect-refuse-retry storm against Lockly's broker several times a
+        # second, which risks the account being throttled.
+        self._refusals += 1
+        permanent = rc == 5
+        exhausted = permanent or self._refusals >= _MAX_REFUSALS
+        # A refusal on the first address is not proof the account has no push —
+        # it may be the wrong broker for this account. If the API named a
+        # different one, try that before going any further.
+        next_broker = self._broker_index + 1 < len(self._brokers())
+
+        if not exhausted or next_broker:
+            _LOGGER.warning(
+                "Lockly MQTT connection refused rc=%s — real-time push "
+                "disabled, polling continues",
+                rc,
+            )
+        if not exhausted:
+            return  # paho reconnects by itself
+        if next_broker:
+            self._broker_index += 1
+            host, port = self._brokers()[self._broker_index]
+            _LOGGER.info(
+                "Lockly MQTT: trying %s:%s instead, the address "
+                "getHeartbeatTime reported for this account",
+                host, port,
+            )
+            # Set before stopping the loop, not inside the coroutine that runs
+            # later: loop_stop() trips on_disconnect, and without the flag
+            # already up that handler warns about a disconnection we caused on
+            # purpose — reporting one refusal twice.
+            self._switching = True
+            client.loop_stop()
+            self._hass.loop.call_soon_threadsafe(
+                self._hass.async_create_task, self._switch_broker()
+            )
+            return
+
+        # Every address has refused. Stop paho's loop and come back later with
+        # a fresh login rather than writing push off until a restart.
+        delay = self._next_recovery_delay()
+        _LOGGER.warning(
+            "Lockly MQTT connection refused rc=%s%s — real-time push paused, "
+            "polling continues; logging in again and retrying in %s",
+            rc,
+            " (not authorised)" if permanent else "",
+            _describe_delay(delay),
+        )
+        self._give_up()
+        self._hass.loop.call_soon_threadsafe(self._schedule_recovery, delay)
+
+    def _next_recovery_delay(self) -> float:
+        """The wait before the next fresh-login retry, advancing the schedule."""
+        delay = _RECOVERY_DELAYS[min(self._recoveries, len(_RECOVERY_DELAYS) - 1)]
+        self._recoveries += 1
+        return delay
+
+    def _schedule_recovery(self, delay: float) -> None:
+        """Arrange a fresh-login retry. Runs on the event loop."""
+        if self._closed:
+            return
+        if self._recovery_cancel is not None:
+            self._recovery_cancel()
+        self._recovery_cancel = async_call_later(self._hass, delay, self._async_recover)
+
+    async def _async_recover(self, _now=None) -> None:
+        """Log in afresh, then connect again starting from the first address."""
+        self._recovery_cancel = None
+        if self._closed:
+            return
+        if not await self._coordinator.async_renew_login():
+            # The login itself failed, so connecting now would only offer the
+            # broker the token it has already refused. Wait for the next step.
+            delay = self._next_recovery_delay()
+            _LOGGER.debug(
+                "Lockly MQTT: no fresh login to retry with; next attempt in %s",
+                _describe_delay(delay),
+            )
+            self._schedule_recovery(delay)
+            return
+        self._broker_index = 0
+        self._refusals = 0
+        await self.async_stop()
+        # async_shutdown may have run while the login was in flight.
+        await self.async_start()
+
+    def async_update_credentials(self) -> None:
+        """Give the live client the coordinator's current token.
+
+        paho keeps the credentials it was given and offers them again on every
+        reconnect, so without this a connection that drops a day after startup
+        reconnects with an expired token and is refused. The session itself is
+        left alone: the broker has already accepted it, and dropping it just to
+        swap the token would open a gap in push for no gain.
+        """
+        client = self._client
+        if client is None:
+            return
+        server_client_id = getattr(self._coordinator, "mqtt_client_id", None)
+        client.username_pw_set(
+            _mqtt_username(self._coordinator.email, server_client_id),
+            self._coordinator.jwt,
+        )
+        _LOGGER.debug("Lockly MQTT: renewed token stored for the next reconnect")
+
     def _resolve(self, request_id: str | None, payload: dict) -> None:
         """Hand a reply to whoever is awaiting it.
 
@@ -239,6 +392,8 @@ class LocklyMQTTManager:
         self._hass.loop.call_soon_threadsafe(_set)
 
     async def async_start(self) -> None:
+        if self._closed:
+            return
         jwt = self._coordinator.jwt
         email = self._coordinator.email
 
@@ -256,54 +411,7 @@ class LocklyMQTTManager:
         self._client_id = client_id
 
         def on_connect(client, userdata, flags, rc):
-            if rc == 0:
-                self._connected = True
-                # Logged at info: without it there is no way to tell a working
-                # push connection from one that silently never connected.
-                topic = _CLIENT_TOPIC_PREFIX + client_id
-                _LOGGER.info("Lockly MQTT connected, subscribing to %r", topic)
-                client.subscribe(topic, qos=0)
-            else:
-                self._connected = False
-                # rc=5 is "not authorised": a credential problem, not a
-                # transient one.  paho's network loop reconnects on its own, so
-                # without stopping it here this becomes a connect-refuse-retry
-                # storm against Lockly's broker several times a second, which
-                # risks the account being throttled.
-                self._refusals += 1
-                permanent = rc == 5
-                # A refusal on the first address is not proof the account has no
-                # push — it may be the wrong broker for this account. If the API
-                # named a different one, try that before writing push off.
-                next_broker = self._broker_index + 1 < len(self._brokers())
-                _LOGGER.warning(
-                    "Lockly MQTT connection refused rc=%s%s — real-time push "
-                    "disabled, polling continues",
-                    rc,
-                    " (not authorised; not retrying)"
-                    if permanent and not next_broker
-                    else "",
-                )
-                if (permanent or self._refusals >= _MAX_REFUSALS) and next_broker:
-                    self._broker_index += 1
-                    host, port = self._brokers()[self._broker_index]
-                    _LOGGER.info(
-                        "Lockly MQTT: trying %s:%s instead, the address "
-                        "getHeartbeatTime reported for this account",
-                        host, port,
-                    )
-                    # Set before stopping the loop, not inside the coroutine
-                    # that runs later: loop_stop() trips on_disconnect, and
-                    # without the flag already up that handler warns about a
-                    # disconnection we caused on purpose — reporting one
-                    # refusal twice.
-                    self._switching = True
-                    client.loop_stop()
-                    self._hass.loop.call_soon_threadsafe(
-                        self._hass.async_create_task, self._switch_broker()
-                    )
-                elif permanent or self._refusals >= _MAX_REFUSALS:
-                    self._give_up()
+            self._handle_connect(client, rc, client_id)
 
         def on_disconnect(client, userdata, rc):
             self._connected = False
@@ -654,7 +762,17 @@ class LocklyMQTTManager:
                 }
                 self._coordinator.async_set_updated_data(updated_data)
 
+    async def async_shutdown(self) -> None:
+        """Stop for good, at unload. No recovery may start a session after this."""
+        self._closed = True
+        await self.async_stop()
+
     async def async_stop(self) -> None:
+        # A session being replaced or torn down makes any pending fresh-login
+        # retry moot: whoever stopped it is starting the next one, or nobody is.
+        if self._recovery_cancel is not None:
+            self._recovery_cancel()
+            self._recovery_cancel = None
         if self._client:
             try:
                 await self._hass.async_add_executor_job(self._client.loop_stop)

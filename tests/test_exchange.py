@@ -9,6 +9,7 @@ import base64
 import json
 import sys
 import threading
+import time
 sys.path.insert(0, "/config/lockly_test")  # set by the deploy step; see AGENTS.md
 
 from custom_components.lockly.mqtt import LocklyMQTTManager, _mqtt_username, _truncate
@@ -35,6 +36,7 @@ class FakeClient:
 class FakeHass:
     def __init__(self, loop): self.loop = loop
     async def async_add_executor_job(self, fn, *a): return fn(*a)
+    def async_create_task(self, coro): return self.loop.create_task(coro)
 
 class FakeCoordinator:
     """Enough of the coordinator for _process_device_state to write into."""
@@ -239,6 +241,217 @@ async def main():
           _mqtt_username("Name@Example.com", "01ABC"), "01abc_name@example.com")
     check("no client id means no prefix",
           _mqtt_username("a@b.com", None), "a@b.com")
+
+    # ── refusal recovery ─────────────────────────────────────────────────────
+    # A refusal from every broker address used to end push until Home
+    # Assistant restarted. Every rc=5 in a month of logs on the development
+    # account followed the token, and a fresh login cleared each one, so the
+    # client now comes back with a new login on a slow schedule.
+    import custom_components.lockly.mqtt as mqtt_mod
+
+    scheduled = []
+
+    def fake_call_later(_hass, delay, job):
+        scheduled.append((delay, job))
+        return lambda: scheduled.append(("cancelled", delay))
+
+    mqtt_mod.async_call_later = fake_call_later
+
+    class StopClient:
+        def __init__(self):
+            self.stopped = self.disconnected = 0
+            self.subscribed, self.creds = [], None
+        def loop_stop(self): self.stopped += 1
+        def disconnect(self): self.disconnected += 1
+        def subscribe(self, topic, qos=0): self.subscribed.append(topic)
+        def username_pw_set(self, user, pwd): self.creds = (user, pwd)
+
+    class RecoveryCoord:
+        def __init__(self, renew_ok=True, host=None):
+            self.mqtt_host, self.mqtt_port, self.mqtt_client_id = host, None, None
+            self.email, self.jwt, self.data = "Me@Example.com", "token-1", {}
+            self.renew_ok, self.renewals = renew_ok, 0
+        async def async_renew_login(self):
+            self.renewals += 1
+            if self.renew_ok:
+                self.jwt = f"token-{self.renewals + 1}"
+            return self.renew_ok
+
+    def manager_for(coord):
+        """A manager with a fake client, recording each session it starts."""
+        mgr = LocklyMQTTManager(hass, coord)
+        mgr._client = StopClient()
+        starts = []
+        async def fake_start():
+            starts.append(mgr._broker_index)
+        mgr.async_start = fake_start
+        return mgr, starts
+
+    print("refusal recovery: every address refused")
+    coord = RecoveryCoord()
+    mgr, starts = manager_for(coord)
+    client = mgr._client
+    scheduled.clear()
+    mgr._handle_connect(client, 5, "cid")
+    await asyncio.sleep(0)
+    check("paho's loop is stopped", client.stopped, 1)
+    check("a fresh-login retry is scheduled in 30 s", [d for d, _ in scheduled], [30])
+    check("not reported as connected", mgr.connected, False)
+
+    mgr._broker_index = 1            # as if the reported address was the last tried
+    await scheduled[-1][1](None)
+    check("the retry logs in afresh", coord.renewals, 1)
+    check("and starts again from the first address", starts, [0])
+
+    print("refusal recovery: schedule")
+    mgr, _ = manager_for(RecoveryCoord())
+    delays = [mgr._next_recovery_delay() for _ in range(9)]
+    check("delays grow", delays[:7], [30, 300, 1800, 3600, 7200, 14400, 21600])
+    check("then hold at six hours", delays[7:], [21600, 21600])
+    accepted = StopClient()
+    mgr._handle_connect(accepted, 0, "cid")
+    check("a connection is reported", mgr.connected, True)
+    check("and subscribes to its own topic", accepted.subscribed, ["client/cid"])
+    check("and resets the schedule", mgr._next_recovery_delay(), 30)
+
+    print("refusal recovery: the login itself fails")
+    coord = RecoveryCoord(renew_ok=False)
+    mgr, starts = manager_for(coord)
+    scheduled.clear()
+    mgr._handle_connect(mgr._client, 5, "cid")
+    await asyncio.sleep(0)
+    await scheduled[-1][1](None)
+    check("no connection is attempted with the refused token", starts, [])
+    check("the next retry is further out", [d for d, _ in scheduled], [30, 300])
+
+    print("refusal recovery: a transient refusal")
+    mgr, _ = manager_for(RecoveryCoord())
+    scheduled.clear()
+    mgr._handle_connect(mgr._client, 3, "cid")
+    await asyncio.sleep(0)
+    check("leaves paho to retry by itself", (mgr._client.stopped, scheduled), (0, []))
+
+    print("refusal recovery: a second address comes first")
+    coord = RecoveryCoord(host="mqtt-clb-1143679798.us-west-2.elb.amazonaws.com")
+    mgr, starts = manager_for(coord)
+    scheduled.clear()
+    mgr._handle_connect(mgr._client, 5, "cid")
+    await asyncio.sleep(0.05)
+    check("the reported address is tried", (mgr._broker_index, starts), (1, [1]))
+    check("before any fresh-login retry", scheduled, [])
+
+    print("refusal recovery: shutdown")
+    mgr, starts = manager_for(RecoveryCoord())
+    scheduled.clear()
+    mgr._handle_connect(mgr._client, 5, "cid")
+    await asyncio.sleep(0)
+    retry = scheduled[0][1]
+    await mgr.async_shutdown()
+    check("cancels the pending retry", scheduled[-1][0], "cancelled")
+    await retry(None)
+    check("and a retry already under way does not reconnect", starts, [])
+    await LocklyMQTTManager.async_start(mgr)
+    check("nor can anything else start a session", mgr._client, None)
+
+    # paho offers the credentials it was given on every reconnect, so a token
+    # renewed by the coordinator has to reach the live client.
+    print("renewed token reaches the live client")
+    coord = RecoveryCoord()
+    mgr, _ = manager_for(coord)
+    coord.jwt = "renewed"
+    mgr.async_update_credentials()
+    check("username lowered, new token as password",
+          mgr._client.creds, ("me@example.com", "renewed"))
+    mgr._client = None
+    mgr.async_update_credentials()   # no client: nothing to do, must not raise
+
+    # ── login token renewal ──────────────────────────────────────────────────
+    # Lockly's tokens last 24 hours, and nothing renewed them: the one given at
+    # startup was offered to the broker for as long as Home Assistant ran.
+    print("login token renewal timing")
+    from custom_components.lockly.api import jwt_expiry, token_renewal_delay
+
+    def make_jwt(claims):
+        def enc(d):
+            return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+        return f"{enc({'alg': 'HS256'})}.{enc(claims)}.signature"
+
+    now = 1_800_000_000
+    day = make_jwt({"iat": now, "exp": now + 86400})
+    check("exp is read", jwt_expiry(day), now + 86400)
+    check("renewed an hour before a 24 h token expires", token_renewal_delay(day, now), 82800)
+    check("never sooner than half an hour",
+          token_renewal_delay(make_jwt({"exp": now + 600}), now), 1800)
+    check("an expired token gets the same floor",
+          token_renewal_delay(make_jwt({"exp": now - 5}), now), 1800)
+    check("never later than 23 h",
+          token_renewal_delay(make_jwt({"exp": now + 30 * 86400}), now), 23 * 3600)
+    check("an unreadable token is renewed after 12 h",
+          token_renewal_delay("not-a-jwt", now), 12 * 3600)
+    check("as is a missing one", token_renewal_delay(None, now), 12 * 3600)
+
+    # The coordinator side, driven through its own methods on a stand-in.
+    print("login token renewal in the coordinator")
+    import custom_components.lockly as lockly_mod
+
+    Coord = lockly_mod.LocklyCoordinator
+    # Twenty hours left, so the expected wait (19 h) is neither cap nor floor.
+    fresh = make_jwt({"exp": int(time.time()) + 20 * 3600})
+    renewals_scheduled = []
+    lockly_mod.async_call_later = (
+        lambda _h, delay, job: renewals_scheduled.append(delay) or (lambda: None)
+    )
+
+    class StandIn:
+        """Just the attributes _login and the renewal paths touch."""
+        def __init__(self):
+            self.hass, self.email, self.password = None, "a@b.com", "pw"
+            self.jwt, self.locks, self.des3_key = "old", [{"ID": "x"}], b"k" * 24
+            self.mqtt_client_id = self.mqtt_host = self.mqtt_port = None
+            self._session, self._token_renewal_cancel = object(), None
+            self._live_init_attempts = {}
+            self.config_entry = type("Entry", (), {"entry_id": "01ABC"})()
+            self.credential_updates = 0
+            self._mqtt_manager = self
+        async def _ensure_session(self): pass
+        def async_update_credentials(self): self.credential_updates += 1
+        def _schedule_token_renewal(self, delay=None):
+            Coord._schedule_token_renewal(self, delay)
+        async def _login(self): await Coord._login(self)
+        async def async_renew_login(self): return await Coord.async_renew_login(self)
+        async def _async_renew_token(self, _now=None): await Coord._async_renew_token(self, _now)
+
+    async def login_ok(_s, _e, _p): return fresh
+    async def login_refused(_s, _e, _p): return None
+    async def devices_ok(_s, _j, _e): return [{"ID": "x"}, {"ID": "y"}], b"n" * 24
+    async def devices_none(_s, _j, _e): return [], None
+    async def heartbeat(_s, _j, _k, _d): return None
+
+    lockly_mod.api_get_heartbeat = heartbeat
+    lockly_mod.api_login, lockly_mod.api_get_devices = login_ok, devices_ok
+    c = StandIn()
+    renewals_scheduled.clear()
+    await Coord._async_renew_token(c)
+    check("a renewal takes the new token", c.jwt, fresh)
+    check("and the new device list", len(c.locks), 2)
+    check("hands it to the MQTT client", c.credential_updates, 1)
+    check("schedules the next an hour before the token expires",
+          len(renewals_scheduled) == 1 and abs(renewals_scheduled[0] - 19 * 3600) < 5, True)
+    check("and wakes no lock", c._live_init_attempts, {})
+
+    lockly_mod.api_get_devices = devices_none
+    c = StandIn()
+    renewals_scheduled.clear()
+    await Coord._async_renew_token(c)
+    check("a renewal whose device list fails keeps the old token", c.jwt, "old")
+    check("and the old locks", c.locks, [{"ID": "x"}])
+    check("tells the MQTT client nothing", c.credential_updates, 0)
+    check("and tries again in half an hour", renewals_scheduled, [1800])
+
+    lockly_mod.api_login = login_refused
+    c = StandIn()
+    check("a refused login reports failure rather than raising", await Coord.async_renew_login(c), False)
+    check("and keeps the old token", c.jwt, "old")
 
     print()
     print(f"{len(fails)} failure(s): {fails}" if fails else "all exchange checks passed")

@@ -125,7 +125,9 @@ Authorization: Bearer eyJhbGci...
 
 The `TokenRenewInterceptor` OkHttp interceptor extracts this header after every successful API call and stores it in `SharedPreferences`. Any API call can refresh the token.
 
-Token lifetime is approximately 24 hours. When expired the server returns `cod != "200"` on any endpoint; handle by re-calling `login`.
+Token lifetime is exactly 24 hours: `exp - iat = 86400` in the captured token. When expired the server returns `cod != "200"` on any endpoint; handle by re-calling `login`. The app's interceptor also treats HTTP 401 and 403 as expiry and fetches a new token through `getNewToken` before retrying the request.
+
+The MQTT broker uses this token as its password and checks it only at CONNECT. A session that is already up survives the token's expiry; one recorded install held a single connection for seven days. The next reconnect is where an old token fails. From 0.7.15 the integration renews the token an hour before `exp`, reading the claim without verifying the signature, and gives the new token to the live paho client for its next reconnect.
 
 ---
 
@@ -1100,9 +1102,33 @@ trace was performed on a question that only appeared to be the blocker.
 
 > **A caution learned the hard way.** paho's network loop reconnects on its own,
 > so an `rc=5` refusal becomes a connect-refuse-retry loop several times a
-> minute against Lockly's broker. Treat `rc=5` as permanent and stop the loop.
-> Guessing at credentials means sending authenticated traffic at their
-> infrastructure, and that has consequences.
+> minute against Lockly's broker. Stop the loop on `rc=5`: asking again with
+> the same token gets the same answer. Guessing at credentials means sending
+> authenticated traffic at their infrastructure, and that has consequences.
+
+### `rc=5` follows the token, not the account
+
+Until 0.7.15 an `rc=5` from every broker address ended push until Home
+Assistant restarted. A month of logs from the account this integration was
+developed against (2026-09-19 to 2026-10-19) shows that was the wrong response:
+
+| When | What happened |
+|---|---|
+| 2026-09-27, twice | Refused about 50 s after an HA start, with the first poll running between login and CONNECT. A re-login followed 30 s later, most likely the "all lock queries failed" path on that first poll. The broker accepted the new token 0.4 s after that login, both times |
+| 2026-10-02, 2026-10-05 | Refused seconds after an HA start. Nothing in the code retried, so push stayed off until a later restart |
+| 2026-10-19 01:18 | A session that had been up for 18 hours dropped (`rc=7`). Both reconnects were refused with the same token. An HA restart at 02:43, which meant a fresh login, connected at once |
+
+The reporter on [#14](https://github.com/Forcky/LocklyHA/issues/14) saw the
+same thing, and it cleared within a day without any change on their side.
+
+What makes the broker refuse a particular token is still unknown. In the
+2026-10-19 case the token was 18 hours old, so it had not reached its own
+`exp`. The pattern is still consistent: a fresh login has cleared every refusal
+recorded so far. So from 0.7.15, once every address has refused, the client
+stops paho's loop and comes back with a new login after 30 s, 5 min, 30 min,
+1 h, 2 h, 4 h, then every 6 h. A successful connection resets that schedule.
+Each attempt costs one login plus one CONNECT per address, which is nothing
+like the storm the caution above is about.
 
 ### Two brokers, and `rc=5` may just mean the wrong one
 

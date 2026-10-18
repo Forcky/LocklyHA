@@ -30,7 +30,16 @@ from .capabilities import (
     UNLOCK_TYPE_HOST,
     LockCapabilities,
 )
-from .const import API_BASE, API_USER_AGENT, COMMON_BODY, SENDDATA_TIMEOUT
+from .const import (
+    API_BASE,
+    API_USER_AGENT,
+    COMMON_BODY,
+    SENDDATA_TIMEOUT,
+    TOKEN_RENEW_FALLBACK_SECONDS,
+    TOKEN_RENEW_MARGIN_SECONDS,
+    TOKEN_RENEW_MAX_SECONDS,
+    TOKEN_RENEW_MIN_SECONDS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -753,6 +762,37 @@ def _headers(jwt: str | None = None) -> dict:
     if jwt:
         h["Authorization"] = f"Bearer {jwt}"
     return h
+
+
+def jwt_expiry(jwt: str | None) -> float | None:
+    """The token's ``exp`` claim in epoch seconds, or None if it cannot be read.
+
+    Read without checking the signature. It only decides when to log in again,
+    and a wrong answer costs one renewal that is early or late, not access.
+    """
+    try:
+        claims = jwt.split(".")[1]
+        claims += "=" * (-len(claims) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(claims)).get("exp")
+        return float(exp) if exp else None
+    except Exception:  # noqa: BLE001 - any malformed token means "unknown"
+        return None
+
+
+def token_renewal_delay(jwt: str | None, now: float) -> float:
+    """Seconds until the login token should be renewed.
+
+    An hour ahead of the token's own expiry, held between half an hour and 23
+    hours. A token whose expiry cannot be read is renewed after 12 hours, half
+    the lifetime every token seen so far has had.
+    """
+    exp = jwt_expiry(jwt)
+    if exp is None:
+        return float(TOKEN_RENEW_FALLBACK_SECONDS)
+    return float(min(
+        TOKEN_RENEW_MAX_SECONDS,
+        max(TOKEN_RENEW_MIN_SECONDS, exp - now - TOKEN_RENEW_MARGIN_SECONDS),
+    ))
 
 
 # ── HTTP API calls ─────────────────────────────────────────────────────────────
