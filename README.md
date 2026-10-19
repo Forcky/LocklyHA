@@ -3,7 +3,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 [![GitHub Release](https://img.shields.io/github/v/release/Forcky/LocklyHA)](https://github.com/Forcky/LocklyHA/releases)
-[![Version](https://img.shields.io/badge/version-0.7.15-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.15)
+[![Version](https://img.shields.io/badge/version-0.7.16-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.16)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Control and monitor your **Lockly smart locks** from Home Assistant. This integration communicates with the Lockly cloud API using the same protocol as the official Lockly mobile app.
@@ -206,8 +206,8 @@ There are three sources, and the sensor prefers them in this order:
 
 | `source` | Where it comes from | How much to trust it |
 |---|---|---|
-| `reported` | the percentage the lock pushes on the MQTT channel | the lock's own figure, the same one the Lockly app shows |
-| `voltage` | `wakeup_voltage` from a live query, through our 4×AA curve | a real measurement, but our curve rather than Lockly's |
+| `reported` | the percentage the lock pushes on the MQTT channel, or, for a lock on a rechargeable pack, the one in its status response | the lock's own figure, the same one the Lockly app shows |
+| `voltage` | `wakeup_voltage` from a live query, through our 4×AA curve | a real measurement, but our curve rather than Lockly's. AA locks only: a rechargeable pack reports no voltage (from 0.7.16) |
 | `low battery flag` | the cloud cache's binary low/normal flag | **not a measurement** — 10 % and 90 % are sentinels standing in for "low" and "not low" |
 
 > **Check `source` before you set a low-battery alert.** A lock that only ever
