@@ -453,6 +453,36 @@ async def main():
     check("a refused login reports failure rather than raising", await Coord.async_renew_login(c), False)
     check("and keeps the old token", c.jwt, "old")
 
+    # A poll that returns a status used to rebuild the lock's data from the
+    # lock list and that status alone, erasing the battery percentage the lock
+    # had pushed over MQTT (#10) and the last access event.
+    print("a poll keeps what only other routes deliver")
+
+    async def cached(_s, _j, _k, _e, _lock):
+        return {"is_locked": True, "low_battery": False, "door_sensor_open": False}
+
+    lockly_mod.api_cached_status = cached
+
+    class PollStandIn:
+        def __init__(self):
+            self.jwt, self.des3_key, self.email = "t", b"k" * 24, "a@b.com"
+            self.locks = [{"ID": "x", "na": "Back Door"}]
+            self.data = {"x": {"ID": "x", "battery_percent": 96,
+                               "last_access_event": {"tm": 1}, "wakeup_voltage": 65376,
+                               "is_locked": False}}
+            self._session, self._cache_supported = object(), True
+            self._live_init_attempts, self._live_init_retry_at = {}, {}
+            self._capabilities, self._door_sensor_proven, self._nonces = {}, set(), {}
+        async def _ensure_session(self): pass
+        def _learn_from_status(self, lock, status):
+            Coord._learn_from_status(self, lock, status)
+
+    out = await Coord._async_update_data(PollStandIn())
+    check("the pushed battery percentage survives", out["x"].get("battery_percent"), 96)
+    check("so does the last access event", out["x"].get("last_access_event"), {"tm": 1})
+    check("the new reading is applied", out["x"].get("is_locked"), True)
+    check("an old voltage is not carried over", "wakeup_voltage" in out["x"], False)
+
     print()
     print(f"{len(fails)} failure(s): {fails}" if fails else "all exchange checks passed")
     return 1 if fails else 0

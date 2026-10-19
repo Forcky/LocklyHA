@@ -23,6 +23,7 @@ from .capabilities import (
     CMD_SET_AUTO_LOCK,
     CMD_LOCK_SETTINGS,
     DEFAULT_CAPABILITIES,
+    LITHIUM_BATTERY_TYPES,
     LOG_RECORD_CHARS_WIDE,
     PAGING_DATE_UNLIMITED,
     PAGING_LOG_RECORD_CHARS,
@@ -669,16 +670,34 @@ def parse_ack(ack_hex: str, master_code: str, uuid: str) -> dict[str, Any]:
             # door shut.
             "door_sensor_open": bool(status_byte & 1),
         }
-        if len(d) >= 14:
-            result["wakeup_voltage"] = int(d[10:12], 16) + int(d[12:14], 16) * 256
-        if len(d) >= 18:
-            result["start_voltage"] = int(d[14:16], 16) + int(d[16:18], 16) * 256
+        # The lock type sits near the end of the block, but it decides how the
+        # battery bytes near the start are read, so it is looked at first.
+        lock_type = int(d[36:38], 16) if len(d) >= 38 else None
+        if lock_type in LITHIUM_BATTERY_TYPES:
+            # A rechargeable pack: byte 7 is the lock's own percentage, and
+            # byte 8 reading F1 means the lock wants it re-checked, so there is
+            # no figure yet. QueryLockStatusCmd reads exactly that and no
+            # voltage at all. Reading these bytes as voltages is what put
+            # 653.76 V on a PGK728WRHK (#10), which the AA curve clamped to 100 %.
+            if len(d) >= 18 and d[16:18] != "f1":
+                pct = int(d[14:16], 16)
+                if 0 <= pct <= 100:
+                    result["battery_percent"] = pct
+            _LOGGER.debug(
+                "lithium battery bytes %s (byte 7 = %d)",
+                d[10:18], int(d[14:16], 16) if len(d) >= 16 else -1,
+            )
+        else:
+            if len(d) >= 14:
+                result["wakeup_voltage"] = int(d[10:12], 16) + int(d[12:14], 16) * 256
+            if len(d) >= 18:
+                result["start_voltage"] = int(d[14:16], 16) + int(d[16:18], 16) * 256
         if len(d) >= 36:
             result["auto_unlock_delay_s"] = int(d[32:34], 16) + int(d[34:36], 16) * 256
-        if len(d) >= 38:
+        if lock_type is not None:
             # QueryLockStatusCmd: lockType = m86670y(data[36:38]) — a plain byte.
             # Selects the command format for subsequent lock/unlock frames.
-            result["lock_type"] = int(d[36:38], 16)
+            result["lock_type"] = lock_type
         if len(d) >= 54:
             # QueryLockStatusCmd stores data[38:54] as ble_aes_random_numbers_1062,
             # keyed by lock uuid, and replays it as the nonce in the next command.

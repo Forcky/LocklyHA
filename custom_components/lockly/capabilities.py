@@ -152,6 +152,27 @@ _VISION = frozenset({
     117,  # PGK798HK
 })
 
+# lithiumBattery(): locks on a rechargeable pack, not AA cells. Their status
+# response carries a battery percentage in byte 7 instead of the two voltage
+# fields AA locks send there (QueryLockStatusCmd, both apps). Read as a voltage,
+# a PGK728WRHK reported 653.76 V on #10. LOCKLY 3.2.9 lists the first nine;
+# Lockly Home 1.4.8 adds the last four.
+LITHIUM_BATTERY_TYPES = frozenset({
+    80,   # PGD798NV (is7ModeLithiumBattery)
+    84,   # PGD899
+    94,   # PGD698LL
+    95,   # PGD698DL
+    96,   # PGD898D
+    105,  # PGK728WRHK
+    112,  # PGD899X
+    113,  # PGD899G
+    117,  # PGK798HK
+    130,  # PGD899B
+    136,  # PGD899GR
+    137,  # PGD899BR
+    141,  # PGD898DS
+})
+
 # isSupport500GroupPassword(): PGD728FN21 always, PGD238T from lock fw 1.00.01.
 _500_GROUP_PASSWORD = frozenset({129})       # PGD728FN21
 _500_GROUP_PASSWORD_VERSIONED = frozenset({88})  # PGD238T

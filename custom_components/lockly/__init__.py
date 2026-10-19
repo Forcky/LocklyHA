@@ -101,6 +101,11 @@ def _rate_rssi(rssi: int | None) -> str:
 
 PLATFORMS = ["binary_sensor", "lock", "sensor"]
 
+# Per-lock fields set by something other than a status reading — the MQTT
+# battery push and the access-log poll — which a poll rebuilding a lock's data
+# from a fresh status must carry over rather than drop.
+_CARRIED_FIELDS = ("battery_percent", "last_access_event")
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = LocklyCoordinator(hass, entry)
@@ -468,8 +473,18 @@ class LocklyCoordinator(DataUpdateCoordinator):
 
             if status:
                 self._learn_from_status(lock, status)
+                # Rebuilt from the lock list and this reading, except for the
+                # fields that only ever arrive by another route. Dropping them
+                # here meant every poll that returned a status erased the
+                # battery percentage the lock had pushed over MQTT, and the
+                # sensor fell back to a voltage figure until the next push
+                # (#10), and erased the last access event until the next
+                # history poll. Only these two are carried: a stale reading of
+                # anything the status itself reports must not outlive it.
+                previous = (self.data or {}).get(lock_id, {})
                 result[lock_id] = {
                     **lock,
+                    **{k: previous[k] for k in _CARRIED_FIELDS if k in previous},
                     **status,
                     # Only meaningful once a closed reading has proven a sensor
                     # exists; before that an "open" circuit is indistinguishable

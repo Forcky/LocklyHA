@@ -193,6 +193,41 @@ def test_ack_parse_real_capture() -> None:
     print(f"       lock_type={parsed.get('lock_type')} wakeup={volts:.2f}V")
 
 
+def _status_plaintext(lock_type: int, bytes_10_18: str) -> str:
+    """A 32-byte status block: firmware, status byte, the battery bytes, type."""
+    d = "03000024" + "00" + bytes_10_18
+    d += "00" * ((36 - len(d)) // 2)
+    d += f"{lock_type:02x}"
+    return d + "00" * ((64 - len(d)) // 2)
+
+
+def test_lithium_battery_status() -> None:
+    """A rechargeable-pack lock reports a percentage where AA locks put volts.
+
+    QueryLockStatusCmd reads byte 7 as the percentage for lithiumBattery()
+    models and skips the voltages. Decoding those bytes as voltages put
+    653.76 V on a PGK728WRHK (#10), and the AA curve clamped that to 100 %.
+    """
+    print("lithium battery status")
+    # 60 FF are the two bytes that read as 653.76 V on #10.
+    visage = parse_ack(_wrap_response(_status_plaintext(105, "60ff" + "60" + "00")), MC, UUID)
+    check("lock type read", visage.get("lock_type"), 105)
+    check("byte 7 is the percentage", visage.get("battery_percent"), 96)
+    check("no voltage is invented", "wakeup_voltage" in visage, False)
+    check("nor a start voltage", "start_voltage" in visage, False)
+
+    pending = parse_ack(_wrap_response(_status_plaintext(105, "60ff" + "60" + "f1")), MC, UUID)
+    check("F1 means not measured yet", "battery_percent" in pending, False)
+
+    junk = parse_ack(_wrap_response(_status_plaintext(117, "0000" + "ff" + "00")), MC, UUID)
+    check("an impossible percentage is refused", "battery_percent" in junk, False)
+
+    aa = parse_ack(_wrap_response(_status_plaintext(21, "1c02" + "1e02")), MC, UUID)
+    check("an AA lock still reads volts", aa.get("wakeup_voltage"), 0x021C)
+    check("and its start voltage", aa.get("start_voltage"), 0x021E)
+    check("and reports no percentage", "battery_percent" in aa, False)
+
+
 def test_mangled_lock_id_is_recognised() -> None:
     """A lock id that has been through a float is detected, a real one is not.
 
@@ -586,6 +621,7 @@ def main() -> int:
         test_22_cmd_type_byte_unchanged,
         test_status_frame_unchanged,
         test_ack_parse_real_capture,
+        test_lithium_battery_status,
         test_mangled_lock_id_is_recognised,
         test_capabilities,
         test_native_auto_lock_frames,
