@@ -3,7 +3,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![HA Version](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 [![GitHub Release](https://img.shields.io/github/v/release/Forcky/LocklyHA)](https://github.com/Forcky/LocklyHA/releases)
-[![Version](https://img.shields.io/badge/version-0.7.16-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.16)
+[![Version](https://img.shields.io/badge/version-0.7.17-blue.svg)](https://github.com/Forcky/LocklyHA/releases/tag/v0.7.17)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Control and monitor your **Lockly smart locks** from Home Assistant. This integration communicates with the Lockly cloud API using the same protocol as the official Lockly mobile app.
@@ -229,10 +229,13 @@ ambiguous between a genuinely open door and no sensor at all, while "closed" can
 only come from a real sensor. The entity therefore appears the first time a lock
 reports closed, and stays available from then on.
 
-In practice it appears on the first poll for any lock whose door is shut. If it
-stays `unavailable`, shut the door and trigger a refresh — restart HA, or send
-any lock command. The learned state is held in memory, so it is re-learned after
-each restart. See [Known Limitations](#known-limitations).
+In practice it appears on the first poll for any lock whose door is shut. From
+0.7.17 a closed reading pushed over MQTT counts too, so a lock that reports its
+door by push, or carries `magnet=closed` in its lock and unlock callbacks, shows
+the entity as soon as it next reports. If it stays `unavailable`, shut the door
+and trigger a refresh — restart HA, or send any lock command. The learned state
+is held in memory, so it is re-learned after each restart. See
+[Known Limitations](#known-limitations).
 
 ---
 
