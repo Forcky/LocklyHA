@@ -755,6 +755,23 @@ class LocklyMQTTManager:
                     continue
                 update[field] = value
 
+            if update.get("door_sensor_open") is False:
+                # A closed door can only be reported by a fitted sensor, however
+                # the reading arrived. Only a status query counted as proof, so
+                # after every restart the Door entity stayed unavailable until
+                # one happened to read the door shut, which on a lock left alone
+                # overnight took hours (#10), while closed callbacks came and
+                # went unused.
+                proven = getattr(self._coordinator, "_door_sensor_proven", None)
+                if proven is not None and device_id not in proven:
+                    proven.add(device_id)
+                    _LOGGER.info(
+                        "Lockly: %s has a working door sensor (reported a closed "
+                        "door over MQTT)",
+                        device_id,
+                    )
+                update["wired_door_sensor_connected"] = True
+
             if update:
                 updated_data = {
                     **self._coordinator.data,

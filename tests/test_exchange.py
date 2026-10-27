@@ -164,6 +164,31 @@ async def main():
         check(f"magnet={value!r} reads door_open={expected}",
               coord.data["dev1"].get("door_sensor_open"), expected)
 
+    # Only a status query used to prove a door sensor, so after a restart the
+    # Door entity stayed unavailable until one read the door shut — hours on a
+    # lock left alone overnight (#10) — though closed callbacks kept arriving.
+    print("device state: a closed callback proves the door sensor")
+
+    class ProvingCoordinator(FakeCoordinator):
+        def __init__(self, data):
+            super().__init__(data)
+            self._door_sensor_proven = set()
+
+    coord = ProvingCoordinator({"dev1": {}})
+    m._coordinator = coord
+    await m._process_device_state(state_msg("payload", "dev1", {"magnet": "opened"}))
+    check("an open door proves nothing", coord._door_sensor_proven, set())
+    check("and leaves the sensor unproven",
+          coord.data["dev1"].get("wired_door_sensor_connected"), None)
+    await m._process_device_state(state_msg("payload", "dev1", {"magnet": "closed"}))
+    check("a closed door proves the sensor", coord._door_sensor_proven, {"dev1"})
+    check("and makes the Door entity available",
+          coord.data["dev1"].get("wired_door_sensor_connected"), True)
+    await m._process_device_state(state_msg("payload", "dev1", {"magnet": "opened"}))
+    check("once proven, an open door stays a reading, not a missing sensor",
+          (coord.data["dev1"]["door_sensor_open"],
+           coord.data["dev1"]["wired_door_sensor_connected"]), (True, True))
+
     print("device state: battery percentage")
     coord = FakeCoordinator({"dev1": {}})
     m._coordinator = coord
