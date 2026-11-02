@@ -491,7 +491,7 @@ async def main():
     class PollStandIn:
         def __init__(self):
             self.jwt, self.des3_key, self.email = "t", b"k" * 24, "a@b.com"
-            self.locks = [{"ID": "x", "na": "Back Door"}]
+            self.locks = [{"ID": "x", "na": "Back Door", "hubid": "PGH220UG2082979T"}]
             self.data = {"x": {"ID": "x", "battery_percent": 96,
                                "last_access_event": {"tm": 1}, "wakeup_voltage": 65376,
                                "is_locked": False}}
@@ -507,6 +507,133 @@ async def main():
     check("so does the last access event", out["x"].get("last_access_event"), {"tm": 1})
     check("the new reading is applied", out["x"].get("is_locked"), True)
     check("an old voltage is not carried over", "wakeup_voltage" in out["x"], False)
+
+    # A hubless lock can only be reached over MQTT. The startup query and the
+    # re-probe used senddata alone, so those locks sat at `unknown` after every
+    # restart until used, and the all-failed re-login dropped the token just
+    # before MQTT connected with it (#16).
+    print("live status by whichever transport reaches the lock")
+    calls = []
+
+    async def cached_spy(_s, _j, _k, _e, lock):
+        calls.append(("cachedstatus", lock["ID"]))
+        return None
+
+    async def senddata_spy(_s, _j, _e, _k, lock, quiet=False):
+        calls.append(("senddata", lock["ID"], quiet))
+        return None
+
+    lockly_mod.api_cached_status = cached_spy
+    lockly_mod.api_query_lock_status = senddata_spy
+
+    class Broker:
+        def __init__(self, connected): self.connected = connected
+
+    class LiveStandIn:
+        _live_query_possible = Coord._live_query_possible
+        _query_live_status = Coord._query_live_status
+        _learn_from_status = Coord._learn_from_status
+        _mqtt_only = staticmethod(Coord._mqtt_only)
+
+        def __init__(self, locks, connected, mqtt_reply=None):
+            self.jwt, self.des3_key, self.email = "t", b"k" * 24, "a@b.com"
+            self.locks, self.data = locks, None
+            self.hass = type("H", (), {"loop": asyncio.get_running_loop()})()
+            self._session, self._cache_supported = object(), True
+            self._live_init_attempts = {lk["ID"]: 0 for lk in locks}
+            self._live_init_retry_at = {}
+            self._capabilities, self._door_sensor_proven, self._nonces = {}, set(), {}
+            self._mqtt_manager = Broker(connected)
+            self.mqtt_reply, self.mqtt_calls = mqtt_reply, []
+        async def _ensure_session(self): pass
+        async def _mqtt_exchange(self, lock, frame, quiet=False):
+            self.mqtt_calls.append((lock["ID"], quiet))
+            return self.mqtt_reply
+
+    H1, P1, M1 = "aa0000000000000000000001", "bb0000000000000000000002", "cc0000000000000000000003"
+    hubless = {"ID": H1, "na": "Front Door", "mc": "59563738", "hubid": ""}
+    reply = {"is_locked": True, "door_sensor_open": False, "lock_type": 105}
+
+    calls.clear()
+    s = LiveStandIn([hubless], connected=False)
+    out = await Coord._async_update_data(s)
+    check("no cachedstatus for a hubless lock", calls, [])
+    check("no attempt spent while MQTT is down", s._live_init_attempts, {H1: 0})
+    check("and the token is not dropped", s.jwt, "t")
+
+    s = LiveStandIn([hubless], connected=True, mqtt_reply=reply)
+    out = await Coord._async_update_data(s)
+    check("the status comes over MQTT", s.mqtt_calls, [(H1, False)])
+    check("and is applied", out[H1].get("is_locked"), True)
+    check("proving the door sensor", out[H1].get("wired_door_sensor_connected"), True)
+    check("with no senddata at all", calls, [])
+    check("and the seeding is finished", s._live_init_attempts, {})
+
+    s = LiveStandIn([hubless], connected=True)
+    s._live_init_attempts = {}
+    s._live_init_retry_at = {H1: 0}
+    await Coord._async_update_data(s)
+    check("the re-probe uses MQTT, quietly", s.mqtt_calls, [(H1, True)])
+
+    calls.clear()
+    hub = {"ID": P1, "na": "Laundry", "mc": "59563738", "hubid": "PGH220UG2082979T"}
+    s = LiveStandIn([hub], connected=True, mqtt_reply=reply)
+    await Coord._async_update_data(s)
+    check("a PGH220 lock still uses cachedstatus and senddata",
+          calls, [("cachedstatus", P1), ("senddata", P1, False)])
+    check("and never the broker", s.mqtt_calls, [])
+    check("and all of them failing still forces a re-login", s.jwt, None)
+
+    calls.clear()
+    matter = {"ID": M1, "na": "Side", "mc": "59563738", "hubid": "PGH260XX0000001"}
+    s = LiveStandIn([matter], connected=True, mqtt_reply=reply)
+    out = await Coord._async_update_data(s)
+    check("a Matter hub lock tries senddata first",
+          calls, [("cachedstatus", M1), ("senddata", M1, False)])
+    check("then the broker", s.mqtt_calls, [(M1, False)])
+    check("and takes its reading", out[M1].get("is_locked"), True)
+
+    # Starting MQTT with no token connected with no password and was refused.
+    print("MQTT never connects without a token")
+
+    class NoTokenCoord(RecoveryCoord):
+        def __init__(self, renew_ok):
+            super().__init__(renew_ok=renew_ok)
+            self.jwt = None
+
+    coord = NoTokenCoord(renew_ok=False)
+    mgr = LocklyMQTTManager(hass, coord)
+    scheduled.clear()
+    await LocklyMQTTManager.async_start(mgr)
+    check("it logs in first", coord.renewals, 1)
+    check("and when that fails, connects nothing", mgr._client, None)
+    check("but schedules a retry", [d for d, _ in scheduled], [30])
+
+    # The half-hourly re-probe of an unreachable lock must stay quiet.
+    print("a quiet exchange stays out of the warnings")
+    import logging
+
+    class Capture(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.DEBUG)
+            self.records = []
+        def emit(self, record): self.records.append(record)
+
+    cap = Capture()
+    mqtt_log = logging.getLogger("custom_components.lockly.mqtt")
+    mqtt_log.addHandler(cap)
+    mqtt_log.setLevel(logging.DEBUG)
+    mgr = LocklyMQTTManager(hass, object())
+    mgr._client, mgr._connected = FakeClient(), True
+    await mgr.async_exchange_frame("dev1", ACK, timeout=0.1, quiet=True)
+    check("a quiet timeout logs nothing above DEBUG",
+          [r.levelname for r in cap.records if r.levelno > logging.DEBUG], [])
+    check("and leaves no quiet request behind", mgr._quiet_requests, set())
+    cap.records.clear()
+    await mgr.async_exchange_frame("dev1", ACK, timeout=0.1)
+    check("an ordinary timeout still warns",
+          [r.levelname for r in cap.records if r.levelno > logging.DEBUG], ["WARNING"])
+    mqtt_log.removeHandler(cap)
 
     print()
     print(f"{len(fails)} failure(s): {fails}" if fails else "all exchange checks passed")

@@ -409,12 +409,16 @@ class LocklyCoordinator(DataUpdateCoordinator):
         result: dict = {}
         any_ok = False
         cache_failed_count = 0
+        cache_queried = 0
 
         for lock in self.locks:
             lock_id = lock["ID"]
             status = None
 
-            if self._cache_supported:
+            # cachedstatus is the hub's own cache, so a lock with no hub cannot
+            # answer it: every call comes back cod=930 and says nothing.
+            if self._cache_supported and lock.get("hubid"):
+                cache_queried += 1
                 status = await api_cached_status(
                     self._session, self.jwt, self.des3_key, self.email, lock
                 )
@@ -427,13 +431,15 @@ class LocklyCoordinator(DataUpdateCoordinator):
             # its state — and its door sensor entity — until HA restarted. The
             # cap is what stops this being a poll loop, because every attempt
             # wakes the lock and some models beep when woken.
+            #
+            # An attempt is only spent when some transport can reach the lock.
+            # A hubless lock is reached over MQTT alone, which is not connected
+            # yet during the first poll after a restart.
             attempts = self._live_init_attempts.get(lock_id)
-            if status is None and attempts is not None:
+            if status is None and attempts is not None and self._live_query_possible(lock):
                 attempts += 1
                 self._live_init_attempts[lock_id] = attempts
-                status = await api_query_lock_status(
-                    self._session, self.jwt, self.email, self.des3_key, lock
-                )
+                status = await self._query_live_status(lock)
                 if status:
                     del self._live_init_attempts[lock_id]
                 elif attempts >= LIVE_INIT_MAX_ATTEMPTS:
@@ -456,14 +462,14 @@ class LocklyCoordinator(DataUpdateCoordinator):
                 # stateless indefinitely after a transient hub failure. Silent
                 # on failure: the warning above was already logged once, and
                 # repeating it every interval would just be noise.
-                if self.hass.loop.time() >= self._live_init_retry_at[lock_id]:
+                if (
+                    self.hass.loop.time() >= self._live_init_retry_at[lock_id]
+                    and self._live_query_possible(lock)
+                ):
                     self._live_init_retry_at[lock_id] = (
                         self.hass.loop.time() + LIVE_INIT_REARM_SECONDS
                     )
-                    status = await api_query_lock_status(
-                        self._session, self.jwt, self.email, self.des3_key, lock,
-                        quiet=True,
-                    )
+                    status = await self._query_live_status(lock, quiet=True)
                     if status:
                         del self._live_init_retry_at[lock_id]
                         _LOGGER.info(
@@ -498,14 +504,19 @@ class LocklyCoordinator(DataUpdateCoordinator):
             else:
                 result[lock_id] = dict(lock)
 
-        if self._cache_supported and cache_failed_count == len(self.locks) and self.locks:
+        if self._cache_supported and cache_queried and cache_failed_count == cache_queried:
             _LOGGER.info(
                 "Lockly: cachedstatus unsupported for this hub (hub firmware too old) — "
                 "state will only update after HA commands"
             )
             self._cache_supported = False
 
-        if not any_ok and self.locks:
+        # Every lock failing can mean the login has gone bad, so the next cycle
+        # logs in afresh. Hubless locks do not count towards that: their REST
+        # calls fail with cod=930 by design, whatever the login. Counting them
+        # dropped the token on every startup of an all-hubless account, two
+        # seconds before MQTT connected with it (#16).
+        if not any_ok and any(lock.get("hubid") for lock in self.locks):
             _LOGGER.warning("All lock queries failed — forcing re-login next cycle")
             self.jwt = None
 
@@ -639,25 +650,67 @@ class LocklyCoordinator(DataUpdateCoordinator):
         )
         return False
 
-    async def _mqtt_exchange_raw(self, lock: dict, frame_hex: str) -> str | None:
+    async def _mqtt_exchange_raw(
+        self, lock: dict, frame_hex: str, quiet: bool = False
+    ) -> str | None:
         """Relay a frame over MQTT and return the lock's unparsed ACK."""
         mqtt = getattr(self, "_mqtt_manager", None)
         if mqtt is None or not mqtt.connected:
             return None
-        return await mqtt.async_exchange_frame(lock["ID"], frame_hex)
+        return await mqtt.async_exchange_frame(lock["ID"], frame_hex, quiet=quiet)
 
-    async def _mqtt_exchange(self, lock: dict, frame_hex: str) -> dict | None:
+    async def _mqtt_exchange(
+        self, lock: dict, frame_hex: str, quiet: bool = False
+    ) -> dict | None:
         """Relay a status-compatible frame to the lock over MQTT and parse it."""
-        ack = await self._mqtt_exchange_raw(lock, frame_hex)
+        ack = await self._mqtt_exchange_raw(lock, frame_hex, quiet)
         if not ack:
             return None
         name = lock.get("na") or lock.get("blename") or lock["ID"]
         parsed = parse_ack(ack, str(lock["mc"]), lock["ID"])
-        if not parsed:
+        if not parsed and not quiet:
             # parse_ack already logs the decoded error byte. Say which lock and
             # which path, so this is not mistaken for a senddata failure.
             _LOGGER.warning("Lockly: %s rejected the frame sent over MQTT", name)
         return parsed or None
+
+    @staticmethod
+    def _mqtt_only(lock: dict) -> bool:
+        """True for a lock that senddata cannot reach but the broker can.
+
+        A lock with no hub talks to the cloud over its own WiFi, and senddata
+        relays through a Secure LINK hub, so it refuses those with cod=930.
+        Matter hubs (PGH260) are on the broker too, but senddata serves them
+        on most accounts, so they keep it and fall back to MQTT only on failure.
+        """
+        return not lock.get("hubid")
+
+    def _live_query_possible(self, lock: dict) -> bool:
+        """Whether any transport could carry a live status query right now."""
+        if not self._mqtt_only(lock):
+            return True
+        mqtt = getattr(self, "_mqtt_manager", None)
+        return mqtt is not None and mqtt.connected
+
+    async def _query_live_status(self, lock: dict, quiet: bool = False) -> dict | None:
+        """One live status reading, by whichever transport reaches the lock.
+
+        The startup query and the half-hourly re-probe used senddata alone, so a
+        hubless lock, which senddata can never reach, sat at `unknown` after
+        every restart until someone used it, with its Door entity unavailable
+        and its battery blank (#16). The broker carries the same status frame to
+        those locks, which refresh_door_state has relied on all along. A Matter
+        hub lock tries senddata first and the broker after it.
+        """
+        frame = build_query_status_cmd(str(lock["mc"]), lock["ID"])
+        if self._mqtt_only(lock):
+            return await self._mqtt_exchange(lock, frame, quiet)
+        status = await api_query_lock_status(
+            self._session, self.jwt, self.email, self.des3_key, lock, quiet=quiet
+        )
+        if status or not str(lock.get("hubid")).startswith(MATTER_HUB_PREFIX):
+            return status
+        return await self._mqtt_exchange(lock, frame, quiet)
 
     def _publish_status(self, lock: dict, status: dict) -> None:
         """Merge a parsed status reading into the coordinator's data.

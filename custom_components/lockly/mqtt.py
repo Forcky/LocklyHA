@@ -186,6 +186,9 @@ class LocklyMQTTManager:
         self._closed = False
         # requestId -> future awaiting that exchange's lockCommandResponse.
         self._pending: dict[str, asyncio.Future] = {}
+        # Requests whose failures are expected and must not reach the log at
+        # WARNING: the half-hourly re-probe of a lock that is not answering.
+        self._quiet_requests: set[str] = set()
 
     @property
     def connected(self) -> bool:
@@ -394,6 +397,15 @@ class LocklyMQTTManager:
     async def async_start(self) -> None:
         if self._closed:
             return
+        if not self._coordinator.jwt:
+            # The coordinator drops its token when a poll fails outright, so its
+            # next cycle logs in afresh. Starting inside that window connected
+            # with no password at all, which the broker refuses with rc=5: the
+            # refusal #16 saw after every restart, rescued 30 s later by the
+            # fresh-login retry. Log in first instead.
+            if not await self._coordinator.async_renew_login():
+                self._schedule_recovery(self._next_recovery_delay())
+                return
         jwt = self._coordinator.jwt
         email = self._coordinator.email
 
@@ -463,7 +475,10 @@ class LocklyMQTTManager:
                         # 3005 "device is offline" means the hub is not on this
                         # channel, which is the difference between a working
                         # command path and a silent one.
-                        _LOGGER.warning(
+                        _LOGGER.log(
+                            logging.DEBUG
+                            if header.get("requestId") in self._quiet_requests
+                            else logging.WARNING,
                             "Lockly MQTT: server returned an exception — code=%s %s",
                             payload.get("code"), payload.get("message"),
                         )
@@ -560,13 +575,21 @@ class LocklyMQTTManager:
         await self.async_start()
 
     async def _exchange(
-        self, header_name: str, payload: dict, device_id: str, timeout: float
+        self,
+        header_name: str,
+        payload: dict,
+        device_id: str,
+        timeout: float,
+        quiet: bool = False,
     ) -> dict | None:
         """Publish one request and wait for the reply carrying our requestId.
 
         Shared by every request/response the broker serves. Returns the reply's
         payload, or None if the publish failed locally or nothing answered.
+        ``quiet`` logs those failures at DEBUG, for callers whose failures are
+        expected and already reported once.
         """
+        level = logging.DEBUG if quiet else logging.WARNING
         client = self._client
         if client is None or not self._connected:
             _LOGGER.debug(
@@ -578,6 +601,8 @@ class LocklyMQTTManager:
         request_id = str(uuid.uuid4())
         future: asyncio.Future = self._hass.loop.create_future()
         self._pending[request_id] = future
+        if quiet:
+            self._quiet_requests.add(request_id)
         envelope = {
             "header": {
                 "namespace": "com.lockly",
@@ -594,14 +619,16 @@ class LocklyMQTTManager:
                 )
             )
             if getattr(info, "rc", 1) != 0:
-                _LOGGER.warning(
+                _LOGGER.log(
+                    level,
                     "Lockly MQTT: publish failed locally for %s (rc=%s)",
                     device_id, getattr(info, "rc", "?"),
                 )
                 return None
             return await asyncio.wait_for(future, timeout)
         except asyncio.TimeoutError:
-            _LOGGER.warning(
+            _LOGGER.log(
+                level,
                 "Lockly MQTT: no reply within %.0fs for %s (%s)",
                 timeout, device_id, header_name,
             )
@@ -611,6 +638,7 @@ class LocklyMQTTManager:
             return None
         finally:
             self._pending.pop(request_id, None)
+            self._quiet_requests.discard(request_id)
 
     async def async_device_info(
         self, device_id: str, timeout: float = _RESPONSE_TIMEOUT
@@ -645,7 +673,11 @@ class LocklyMQTTManager:
         return payload
 
     async def async_exchange_frame(
-        self, device_id: str, frame_hex: str, timeout: float = _RESPONSE_TIMEOUT
+        self,
+        device_id: str,
+        frame_hex: str,
+        timeout: float = _RESPONSE_TIMEOUT,
+        quiet: bool = False,
     ) -> str | None:
         """Send a BLE frame over MQTT and return the lock's ACK as hex.
 
@@ -660,7 +692,9 @@ class LocklyMQTTManager:
         Returns the ACK hex, or None if the publish failed, nothing answered in
         time, or the server reported a delivery error. A returned ACK is the
         lock's own reply and may still be a rejection — the caller parses it.
+        ``quiet`` logs those failures at DEBUG instead of WARNING.
         """
+        level = logging.DEBUG if quiet else logging.WARNING
         client = self._client
         if client is None or not self._connected:
             _LOGGER.debug(
@@ -679,6 +713,7 @@ class LocklyMQTTManager:
             },
             device_id,
             timeout,
+            quiet,
         )
         if payload is None:
             return None
@@ -688,7 +723,8 @@ class LocklyMQTTManager:
         # it as such once made a rejected command look like it had worked.
         code = payload.get("code")
         if code not in (0, "0", None):
-            _LOGGER.warning(
+            _LOGGER.log(
+                level,
                 "Lockly MQTT: server rejected the command for %s — code=%s %s",
                 device_id, code, payload.get("errorMessage"),
             )
@@ -696,15 +732,15 @@ class LocklyMQTTManager:
 
         content = payload.get("commandContent")
         if not content:
-            _LOGGER.warning(
-                "Lockly MQTT: reply for %s carried no lock response", device_id
+            _LOGGER.log(
+                level, "Lockly MQTT: reply for %s carried no lock response", device_id
             )
             return None
         try:
             return base64.b64decode(content).hex().upper()
         except Exception:  # noqa: BLE001
-            _LOGGER.warning(
-                "Lockly MQTT: reply for %s was not decodable base64", device_id
+            _LOGGER.log(
+                level, "Lockly MQTT: reply for %s was not decodable base64", device_id
             )
             return None
 

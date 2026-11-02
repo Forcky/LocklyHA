@@ -211,6 +211,12 @@ The shape that satisfies both:
 - one warning when they are exhausted, then quiet
 - afterwards one probe per `LIVE_INIT_REARM_SECONDS`, silent on failure, info on
   recovery
+- every attempt goes through `_query_live_status`, which uses whatever transport
+  reaches the lock: senddata for a hub lock, MQTT for a hubless one, and MQTT
+  after senddata for a Matter (PGH260) hub. An attempt is only spent when
+  `_live_query_possible` says a transport is there. A hubless lock is MQTT-only,
+  and MQTT isn't connected during the first poll after a restart. "Silent on
+  failure" covers MQTT too: the re-probe passes `quiet=True`.
 
 Any change here must keep the wake rate low enough that a permanently
 unreachable lock is not woken often, while still recovering on its own. Roughly
