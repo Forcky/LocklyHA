@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
@@ -1513,12 +1514,18 @@ async def api_query_lock_log_paged(
     nonce: str | None = None,
     caps: LockCapabilities | None = None,
     max_pages: int = 8,
+    exchange: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> list[dict] | None:
     """Read the access log a page at a time, bounded by a date range.
 
     Preferred over the bulk read on locks whose BLE link cannot carry a large
     response — the bulk form returns the whole log at once and times out, where
     a bounded page is small enough to get through.
+
+    ``exchange`` carries each page's frame instead of senddata and returns the
+    lock's ACK, or None. A hubless lock is reached over the MQTT broker only:
+    senddata relays through a Secure LINK hub and refuses those with cod=930,
+    which is all the log read ever got from them (#16).
     """
     mc = str(lock["mc"])
     uuid = lock["ID"]
@@ -1527,6 +1534,20 @@ async def api_query_lock_log_paged(
 
     for _ in range(max_pages):
         cmd_hex = build_paging_log_cmd(mc, uuid, index, start_ms, end_ms, nonce, caps)
+        if exchange is not None:
+            ack = await exchange(cmd_hex)
+            page = parse_paging_log_ack(ack, mc, uuid) if ack else None
+            if page is None:
+                _LOGGER.debug(
+                    "paged log over MQTT: no usable page %d from %s",
+                    index, lock.get("blename") or uuid,
+                )
+                return records or None
+            records.extend(page["records"])
+            if page["is_end"] or not page["records"]:
+                break
+            index += 1
+            continue
         req = {
             "acct": email,
             "hubid": lock.get("hubid", ""),

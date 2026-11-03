@@ -635,6 +635,62 @@ async def main():
           [r.levelname for r in cap.records if r.levelno > logging.DEBUG], ["WARNING"])
     mqtt_log.removeHandler(cap)
 
+    # The lock log went over senddata only, so a hubless lock got cod=930 and
+    # nothing else (#16). It now goes over the broker, a page at a time, and the
+    # one read per session waits for MQTT rather than being spent before it.
+    print("a hubless lock's access log comes over MQTT")
+    log_calls = []
+
+    async def bulk_spy(_s, _j, _e, _k, lock, nonce=None, caps=None):
+        log_calls.append(("bulk", lock["ID"]))
+        return None
+
+    async def paged_spy(_s, _j, _e, _k, lock, start_ms=None, end_ms=None,
+                        nonce=None, caps=None, exchange=None):
+        log_calls.append(("paged", lock["ID"], exchange is not None))
+        if exchange is not None:
+            await exchange("FRAME")
+        return []
+
+    lockly_mod.api_query_lock_log = bulk_spy
+    lockly_mod.api_query_lock_log_paged = paged_spy
+
+    class LogStandIn:
+        _maybe_read_lock_log = Coord._maybe_read_lock_log
+        _poll_lock_log = Coord._poll_lock_log
+        _live_query_possible = Coord._live_query_possible
+        _caps_for = Coord._caps_for
+        _history_cutoff_ms = Coord._history_cutoff_ms
+        _mqtt_only = staticmethod(Coord._mqtt_only)
+
+        def __init__(self, connected):
+            self.jwt, self.des3_key, self.email, self._session = "t", b"k" * 24, "a@b.com", None
+            self._nonces, self._capabilities = {}, {}
+            self._prefer_paged_log, self._lock_log_read = set(), set()
+            self._mqtt_manager = Broker(connected)
+            self.raw_frames = []
+        async def _mqtt_exchange_raw(self, lock, frame_hex, quiet=False):
+            self.raw_frames.append((lock["ID"], frame_hex))
+            return None
+
+    s = LogStandIn(connected=False)
+    await Coord._maybe_read_lock_log(s, hubless)
+    check("with MQTT down, the read waits", (log_calls, s._lock_log_read), ([], set()))
+
+    s = LogStandIn(connected=True)
+    await Coord._maybe_read_lock_log(s, hubless)
+    check("with MQTT up, it skips the bulk read and pages over MQTT",
+          log_calls, [("paged", H1, True)])
+    check("through the broker", s.raw_frames, [(H1, "FRAME")])
+    check("and counts as this session's read", s._lock_log_read, {H1})
+
+    log_calls.clear()
+    s = LogStandIn(connected=True)
+    await Coord._maybe_read_lock_log(s, hub)
+    check("a hub lock still tries the bulk read, then pages over senddata",
+          log_calls, [("bulk", P1), ("paged", P1, False)])
+    check("and never touches the broker", s.raw_frames, [])
+
     print()
     print(f"{len(fails)} failure(s): {fails}" if fails else "all exchange checks passed")
     return 1 if fails else 0

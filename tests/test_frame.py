@@ -10,12 +10,15 @@ Run inside the Home Assistant container:
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from datetime import datetime
 
 from Crypto.Cipher import AES
 
 from custom_components.lockly.api import (
+    _digits_to_packed_hex,
+    api_query_lock_log_paged,
     build_lock_cmd,
     build_set_auto_lock_cmd,
     disable_auto_lock_in_settings,
@@ -547,6 +550,59 @@ def test_paging_log_frame() -> None:
     check("start time packed", bounded[base + 16:base + 26], "1A0812091E")
 
 
+def test_paged_log_over_an_exchange() -> None:
+    """A hubless lock's log is read over the broker, a page at a time.
+
+    senddata relays through a Secure LINK hub and refuses a hubless lock with
+    cod=930, which is all the log read ever got from one (#16).
+    """
+    print("paged log over MQTT")
+    caps = resolve_capabilities({"mod": "PGK728WRHK"}, lock_type=105)
+
+    def record(date_digits: str, open_type: int, slot: int, rec_id: int) -> str:
+        return (
+            _digits_to_packed_hex(date_digits) + f"{open_type:02x}"
+            + "".join(f"{(slot >> (8 * n)) & 0xFF:02x}" for n in range(4))
+            + f"{rec_id & 0xFF:02x}{(rec_id >> 8) & 0xFF:02x}"
+        )
+
+    def page(total: int, current: int, records: list[str]) -> str:
+        head = "".join(f"{v & 0xFF:02x}{(v >> 8) & 0xFF:02x}"
+                       for v in (total, current, len(records)))
+        return _wrap_response(head + "".join(records))
+
+    pages = [
+        page(2, 1, [record("261102153000", 2, 3, 41)]),
+        page(2, 2, [record("261102160500", 1, 0xFFFFFFFF, 42)]),
+    ]
+    sent: list[str] = []
+
+    async def exchange(frame_hex: str) -> str | None:
+        sent.append(frame_hex)
+        return pages[len(sent) - 1] if len(sent) <= len(pages) else None
+
+    lock = {"ID": UUID, "mc": MC, "blename": "PGK728WRHK0001", "hubid": ""}
+    records = asyncio.run(api_query_lock_log_paged(
+        None, "jwt", "a@b.com", b"k" * 24, lock, nonce=NONCE, caps=caps,
+        exchange=exchange,
+    ))
+    check("both pages are read", len(sent), 2)
+    check("and every record returned", [r["id"] for r in records], [41, 42])
+    check("the slot is kept", records[0]["pid"], 3)
+    check("and the no-credential sentinel becomes None", records[1]["pid"], None)
+    check("the second request asks for page 1",
+          decrypt_frame(sent[1], MC, UUID)[4 + len(encrypt_master_code(MC, UUID)) + 12:][:4],
+          "0100")
+
+    async def silent(_frame_hex: str) -> str | None:
+        return None
+
+    check("no reply means no records, not an error",
+          asyncio.run(api_query_lock_log_paged(
+              None, "jwt", "a@b.com", b"k" * 24, lock, caps=caps, exchange=silent,
+          )), None)
+
+
 def test_open_type_labels() -> None:
     """Readable names for access-log event types, raw code when unknown."""
     print("open type labels")
@@ -639,6 +695,7 @@ def main() -> int:
         test_log_no_credential_sentinel,
         test_log_padding_terminates,
         test_paging_log_frame,
+        test_paged_log_over_an_exchange,
         test_open_type_labels,
         test_credential_dedupe,
         test_operator_resolution,

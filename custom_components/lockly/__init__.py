@@ -1121,6 +1121,17 @@ class LocklyCoordinator(DataUpdateCoordinator):
         lock_id = lock["ID"]
         if not force and lock_id in self._lock_log_read:
             return
+        if not self._live_query_possible(lock):
+            # A hubless lock's log comes over MQTT, which is not connected yet
+            # shortly after a restart. Marking it read now would spend the one
+            # read this session gets on a request nothing could carry.
+            if force:
+                _LOGGER.warning(
+                    "Lockly: cannot read the access log for %s yet — it has no "
+                    "hub, so it is read over MQTT, which is not connected",
+                    lock.get("na") or lock.get("blename") or lock_id,
+                )
+            return
         self._lock_log_read.add(lock_id)
         await self._poll_lock_log(lock)
 
@@ -1134,8 +1145,12 @@ class LocklyCoordinator(DataUpdateCoordinator):
         nonce = self._nonces.get(lock_id)
         caps = self._caps_for(lock)
         cutoff = self._history_cutoff_ms()
+        # A hubless lock is read over the broker, a page at a time. senddata
+        # cannot reach it at all (cod=930, #16), and the bulk read is the one
+        # response too large for some links even over a hub.
+        mqtt_only = self._mqtt_only(lock)
 
-        if lock_id in self._prefer_paged_log:
+        if lock_id in self._prefer_paged_log or mqtt_only:
             records = None
         else:
             records = await api_query_lock_log(
@@ -1149,12 +1164,18 @@ class LocklyCoordinator(DataUpdateCoordinator):
             # a Bluetooth error.  The paged form asks for a bounded window
             # instead, so the response is small enough to get through.
             _LOGGER.debug(
-                "Lockly lock log: %s bulk read unavailable, trying the paged query",
+                "Lockly lock log: %s %s, trying the paged query",
                 lock.get("blename") or lock_id,
+                "has no hub" if mqtt_only else "bulk read unavailable",
             )
+
+            async def over_mqtt(frame_hex: str) -> str | None:
+                return await self._mqtt_exchange_raw(lock, frame_hex)
+
             records = await api_query_lock_log_paged(
                 self._session, self.jwt, self.email, self.des3_key, lock,
                 start_ms=cutoff, end_ms=None, nonce=nonce, caps=caps,
+                exchange=over_mqtt if mqtt_only else None,
             )
             if records:
                 # Stop paying for a bulk attempt that has already been shown to
